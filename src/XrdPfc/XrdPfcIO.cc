@@ -3,21 +3,19 @@
 
 using namespace XrdPfc;
 
-IO::IO(XrdOucCacheIO *io, XrdOucCacheStats &stats, Cache &cache) :
-   m_statsGlobal     (stats),
+IO::IO(XrdOucCacheIO *io, Cache &cache) :
    m_cache           (cache),
    m_traceID         ("IO"),
    m_io              (io)
-{
-   m_path = m_io->Path();
-}
+{}
 
 //==============================================================================
 
 void IO::Update(XrdOucCacheIO &iocp)
 {
    SetInput(&iocp);
-   TRACE_PC(Info, const char* loc = m_io->Location(),
+   RefreshLocation();
+   TRACE_PC(Info, const char* loc = GetLocation(),
             "IO::Update() " << Path() << " location: " <<
             ((loc && loc[0] != 0) ? loc : "<not set>"));
 }

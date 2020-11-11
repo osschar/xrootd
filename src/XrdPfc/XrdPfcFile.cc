@@ -175,11 +175,22 @@ void File::BlocksRemovedFromWriteQ(std::list<Block*>& blocks)
 
 //------------------------------------------------------------------------------
 
+void File::ioUpdated(IO *io)
+{
+   std::string loc(io->GetLocation());
+   XrdSysCondVarHelper _lck(m_state_cond);
+   insert_remote_location(loc);
+}
+
+//------------------------------------------------------------------------------
+
 bool File::ioActive(IO *io)
 {
    // Returns true if delay is needed.
 
    TRACEF(Debug, "File::ioActive start for io " << io);
+
+   std::string loc(io->GetLocation());
 
    {
       XrdSysCondVarHelper _lck(m_state_cond);
@@ -202,6 +213,8 @@ bool File::ioActive(IO *io)
          TRACEF(Info,
                 "\tio_map.size() "           << m_io_map.size() <<
                 ", block_map.size() "        << m_block_map.size() << ", file");
+
+         insert_remote_location(loc);
 
          // XXX Intermediate check for 4.11 - 5.0 transition.
          // Can be removed for 5.1, including member IODetals::m_ioactive_false_reported.
@@ -288,7 +301,8 @@ void File::AddIO(IO *io)
 
    TRACEF(Debug, "File::AddIO() io = " << (void*)io);
 
-   time_t now = time(0);
+   time_t      now = time(0);
+   std::string loc(io->GetLocation());
 
    m_state_cond.Lock();
 
@@ -298,6 +312,8 @@ void File::AddIO(IO *io)
    {
       m_io_map.insert(std::make_pair(io, IODetails(now)));
       m_stats.IoAttach();
+
+      insert_remote_location(loc);
 
       if (m_prefetch_state == kStopped)
       {
@@ -359,11 +375,13 @@ bool File::Open()
 {
    // Sets errno accordingly.
 
-   TRACEF(Dump, "File::Open() open file for disk cache");
+   static const char *tpfx = "File::Open() ";
+
+   TRACEF(Dump, tpfx << "open file for disk cache");
 
    if (m_is_open)
    {
-      TRACEF(Error, "File::Open() file is already opened.");
+      TRACEF(Error, tpfx << "file is already opened.");
       return true;
    }
 
@@ -388,7 +406,7 @@ bool File::Open()
 
    if ((res = myOss.Create(myUser, m_filename.c_str(), 0600, myEnv, XRDOSS_mkpath)) != XrdOssOK)
    {
-      TRACEF(Error, "File::Open() Create failed " << ERRNO_AND_ERRSTR(-res));
+      TRACEF(Error, tpfx << "Create failed " << ERRNO_AND_ERRSTR(-res));
       errno = -res;
       return false;
    }
@@ -396,7 +414,7 @@ bool File::Open()
    m_data_file = myOss.newFile(myUser);
    if ((res = m_data_file->Open(m_filename.c_str(), O_RDWR, 0600, myEnv)) != XrdOssOK)
    {
-      TRACEF(Error, "File::Open() Open failed " << ERRNO_AND_ERRSTR(-res));
+      TRACEF(Error, tpfx << "Open failed " << ERRNO_AND_ERRSTR(-res));
       errno = -res;
       delete m_data_file; m_data_file = 0;
       return false;
@@ -406,7 +424,7 @@ bool File::Open()
    myEnv.Put("oss.cgroup", conf.m_meta_space.c_str());
    if ((res = myOss.Create(myUser, ifn.c_str(), 0600, myEnv, XRDOSS_mkpath)) != XrdOssOK)
    {
-      TRACE(Error, "File::Open() Create failed for info file " << ifn << ERRNO_AND_ERRSTR(-res));
+      TRACE(Error, tpfx << "Create failed for info file " << ifn << ERRNO_AND_ERRSTR(-res));
       errno = -res;
       m_data_file->Close(); delete m_data_file; m_data_file = 0;
       return false;
@@ -415,7 +433,7 @@ bool File::Open()
    m_info_file = myOss.newFile(myUser);
    if ((res = m_info_file->Open(ifn.c_str(), O_RDWR, 0600, myEnv)) != XrdOssOK)
    {
-      TRACEF(Error, "File::Open() Open failed for info file " << ifn  << ERRNO_AND_ERRSTR(-res));
+      TRACEF(Error, tpfx << "Failed for info file " << ifn  << ERRNO_AND_ERRSTR(-res));
       errno = -res;
       delete m_info_file; m_info_file = 0;
       m_data_file->Close(); delete m_data_file;   m_data_file   = 0;
@@ -424,9 +442,9 @@ bool File::Open()
 
    bool initialize_info_file = true;
 
-   if (info_existed && m_cfi.Read(m_info_file, ifn))
+   if (info_existed && m_cfi.Read(m_info_file, ifn.c_str()))
    {
-      TRACEF(Debug, "Open - reading existing info file. (data_existed=" << data_existed  <<
+      TRACEF(Debug, tpfx << "Reading existing info file. (data_existed=" << data_existed  <<
              ", data_size_stat=" << (data_existed ? data_stat.st_size : -1ll) <<
              ", data_size_from_last_block=" << m_cfi.GetExpectedDataFileSize() << ")");
 
@@ -434,21 +452,36 @@ bool File::Open()
       if (data_existed && data_stat.st_size >= m_cfi.GetExpectedDataFileSize())
       {
          initialize_info_file = false;
-      }
-      else
-      {
-         TRACEF(Warning, "Open - basic sanity checks on data file failed, resetting info file.");
+      } else {
+         TRACEF(Warning, tpfx << "Basic sanity checks on data file failed, resetting info file, truncating data file.");
          m_cfi.ResetAllAccessStats();
+         m_data_file->Ftruncate(0);
       }
    }
+
+   if ( ! initialize_info_file && m_cfi.GetCkSumState() != conf.get_cs_Chk())
+   {
+      if (conf.does_cschk_have_missing_bits(m_cfi.GetCkSumState()) &&
+          conf.should_uvkeep_purge(time(0) - m_cfi.GetNoCkSumTimeForUVKeep()))
+      {
+         TRACEF(Info, tpfx << "Cksum state of file insufficient, uvkeep test failed, resetting info file, truncating data file.");
+         initialize_info_file = true;
+         m_cfi.ResetAllAccessStats();
+         m_data_file->Ftruncate(0);
+      } else {
+         // If a file is complete, we don't really need to reset net cksums ... well, maybe next time.
+         m_cfi.DowngradeCkSumState(conf.get_cs_Chk());
+      }
+   }
+
    if (initialize_info_file)
    {
       m_cfi.SetBufferSize(conf.m_bufferSize);
       m_cfi.SetFileSize(m_file_size);
-      m_cfi.Write(m_info_file);
+      m_cfi.SetCkSumState(conf.get_cs_Chk());
+      m_cfi.Write(m_info_file, ifn.c_str());
       m_info_file->Fsync();
-      int ss = (m_file_size - 1)/m_cfi.GetBufferSize() + 1;
-      TRACEF(Debug, "Creating new file info, data size = " <<  m_file_size << " num blocks = "  << ss);
+      TRACEF(Debug, tpfx << "Creating new file info, data size = " <<  m_file_size << " num blocks = "  << m_cfi.GetNBlocks());
    }
 
    m_cfi.WriteIOStatAttach();
@@ -507,7 +540,7 @@ Block* File::PrepareBlockRequest(int i, IO *io, bool prefetch)
    // catch the block while still in memory.
 
    const long long BS   = m_cfi.GetBufferSize();
-   const int last_block = m_cfi.GetSizeInBits() - 1;
+   const int last_block = m_cfi.GetNBlocks() - 1;
 
    long long off     = i * BS;
    long long this_bs = (i == last_block) ? m_file_size - off : BS;
@@ -517,7 +550,8 @@ Block* File::PrepareBlockRequest(int i, IO *io, bool prefetch)
 
    if (buf)
    {
-      b = new (std::nothrow) Block(this, io, buf, off, this_bs, prefetch);
+      b = new (std::nothrow) Block(this, io, buf, off, this_bs, prefetch,
+                                   m_cfi.IsCkSumNet(), m_cfi.IsCkSumCache());
 
       if (b)
       {
@@ -557,7 +591,10 @@ void File::ProcessBlockRequests(BlockList_t& blks, bool prefetch)
    {
       Block *b = *bi;
       BlockResponseHandler* oucCB = new BlockResponseHandler(b, prefetch);
-      b->get_io()->GetInput()->Read(*oucCB, b->get_buff(), b->get_offset(), b->get_size());
+      if (b->req_cksum_net())
+         b->get_io()->GetInput()->pgRead(*oucCB, b->get_buff(), b->get_offset(), b->get_size(), b->ref_cksum_vec());
+      else
+         b->get_io()->GetInput()->Read(*oucCB, b->get_buff(), b->get_offset(), b->get_size());
    }
 }
 
@@ -901,9 +938,15 @@ void File::WriteBlockToDisk(Block* b)
    // write block buffer into disk file
    long long   offset = b->m_offset - m_offset;
    long long   size   = (offset + m_cfi.GetBufferSize()) > m_file_size ? (m_file_size - offset) : m_cfi.GetBufferSize();
-   const char *buff   = &b->m_buff[0];
+   ssize_t     retval;
 
-   ssize_t retval = m_data_file->Write(buff, offset, size);
+   if (b->req_cksum_cache())
+      if (b->has_cksums())
+         retval = m_data_file->pgWrite(b->get_buff(), offset, size, b->ref_cksum_vec().data(), b->ref_cksum_vec().size());
+      else
+         retval = m_data_file->pgWrite(b->get_buff(), offset, size, 0, 0);
+   else
+      retval = m_data_file->Write(b->get_buff(), offset, size);
 
    if (retval < size)
    {
@@ -936,6 +979,11 @@ void File::WriteBlockToDisk(Block* b)
 
       if (b->m_prefetch)
          m_cfi.SetBitPrefetch(blk_idx);
+
+      if (b->req_cksum_net() && ! b->has_cksums())
+      {
+         m_cfi.ResetCkSumNet();
+      }
 
       dec_ref_count(b);
 
@@ -977,7 +1025,7 @@ void File::Sync()
    {
       Stats loc_stats = m_stats.Clone();
       m_cfi.WriteIOStat(loc_stats);
-      m_cfi.Write(m_info_file);
+      m_cfi.Write(m_info_file,m_filename.c_str());
       int cret = m_info_file->Fsync();
       if (cret != XrdOssOK)
       {
@@ -1229,7 +1277,7 @@ void File::Prefetch()
       }
 
       // Select block(s) to fetch.
-      for (int f = 0; f < m_cfi.GetSizeInBits(); ++f)
+      for (int f = 0; f < m_cfi.GetNBlocks(); ++f)
       {
          if ( ! m_cfi.TestBitWritten(f))
          {
@@ -1291,6 +1339,34 @@ XrdSysError* File::GetLog()
 XrdSysTrace* File::GetTrace()
 {
    return Cache::GetInstance().GetTrace();
+}
+
+std::string File::GetRemoteLocations() const
+{
+   std::string s;
+   if ( ! m_remote_locations.empty())
+   {
+      size_t      sl = 0;
+      int         nl = 0;
+      for (std::set<std::string>::iterator i = m_remote_locations.begin(); i != m_remote_locations.end(); ++i, ++nl)
+      {
+         sl += i->size();
+      }
+      s.reserve(2 + sl + 2*nl + nl - 1 + 1);
+      s = '[';
+      int j = 1;
+      for (std::set<std::string>::iterator i = m_remote_locations.begin(); i != m_remote_locations.end(); ++i, ++j)
+      {
+         s += '"'; s += *i; s += '"';
+         if (j < nl) s += ',';
+      }
+      s += ']';
+   }
+   else
+   {
+      s = "[]";
+   }
+   return s;
 }
 
 //==============================================================================

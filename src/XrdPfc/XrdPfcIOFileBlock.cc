@@ -36,8 +36,8 @@
 using namespace XrdPfc;
 
 //______________________________________________________________________________
-IOFileBlock::IOFileBlock(XrdOucCacheIO *io, XrdOucCacheStats &statsGlobal, Cache & cache) :
-  IO(io, statsGlobal, cache), m_localStat(0), m_info(cache.GetTrace(), false), m_info_file(0)
+IOFileBlock::IOFileBlock(XrdOucCacheIO *io, Cache & cache) :
+  IO(io, cache), m_localStat(0), m_info(cache.GetTrace(), false), m_info_file(0)
 {
    m_blocksize = Cache::GetInstance().RefConfiguration().m_hdfsbsize;
    GetBlockSizeFromPath();
@@ -59,9 +59,26 @@ IOFileBlock::~IOFileBlock()
 // I think I need it in ioActive and Read.
 
 //______________________________________________________________________________
+void IOFileBlock::Update(XrdOucCacheIO &iocp)
+{
+   IO::Update(iocp);
+   {
+      XrdSysMutexHelper lock(&m_mutex);
+
+      for (std::map<int, File*>::iterator it = m_blocks.begin(); it != m_blocks.end(); ++it)
+      {
+         // Need to update all File / block objects.
+         if (it->second) it->second->ioUpdated(this);
+      }
+   }
+}
+
+//______________________________________________________________________________
 bool IOFileBlock::ioActive()
 {
    // Called from XrdPosixFile when local connection is closed.
+
+   RefreshLocation();
 
    bool active = false;
    {
@@ -116,7 +133,7 @@ void IOFileBlock::CloseInfoFile()
          Stats as;
          m_info.WriteIOStatDetach(as);
       }
-      m_info.Write(m_info_file);
+      m_info.Write(m_info_file, GetFilename().c_str());
       m_info_file->Fsync();
       m_info_file->Close();
 
@@ -157,8 +174,7 @@ File* IOFileBlock::newBlockFile(long long off, int blocksize)
 {
    // NOTE: Can return 0 if opening of a local file fails!
 
-   XrdCl::URL url(GetInput()->Path());
-   std::string fname = url.GetPath();
+   std::string fname = GetFilename();
 
    std::stringstream ss;
    ss << fname;
@@ -170,7 +186,7 @@ File* IOFileBlock::newBlockFile(long long off, int blocksize)
 
    TRACEIO(Debug, "FileBlock::FileBlock(), create XrdPfcFile ");
 
-   File* file = Cache::GetInstance().GetFile(fname, this, off, blocksize);
+   File *file = Cache::GetInstance().GetFile(fname, this, off, blocksize);
    return file;
 }
 
@@ -197,9 +213,7 @@ long long IOFileBlock::FSize()
 //______________________________________________________________________________
 int IOFileBlock::initLocalStat()
 {
-   XrdCl::URL url(GetPath());
-   std::string path = url.GetPath();
-   path += ".cinfo";
+   std::string path = GetFilename() + Info::s_infoExtension;
 
    int res = -1;
    struct stat tmpStat;
@@ -211,7 +225,7 @@ int IOFileBlock::initLocalStat()
       m_info_file = m_cache.GetOss()->newFile(m_cache.RefConfiguration().m_username.c_str());
       if (m_info_file->Open(path.c_str(), O_RDWR, 0600, myEnv) == XrdOssOK)
       {
-         if (m_info.Read(m_info_file, path))
+         if (m_info.Read(m_info_file, path.c_str()))
          {
             tmpStat.st_size = m_info.GetFileSize();
             TRACEIO(Info, "IOFileBlock::initCachedStat successfuly read size from existing info file = " << tmpStat.st_size);
@@ -245,7 +259,7 @@ int IOFileBlock::initLocalStat()
                m_info.SetBufferSize(m_cache.RefConfiguration().m_bufferSize);
                m_info.DisableDownloadStatus();
                m_info.SetFileSize(tmpStat.st_size);
-               m_info.Write(m_info_file, path);
+               m_info.Write(m_info_file, path.c_str());
                m_info_file->Fsync();
             }
             else

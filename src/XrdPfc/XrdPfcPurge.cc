@@ -5,6 +5,7 @@
 #include <sys/time.h>
 
 #include "XrdOuc/XrdOucEnv.hh"
+#include "XrdOss/XrdOssAt.hh"
 #include "XrdSys/XrdSysTrace.hh"
 
 using namespace XrdPfc;
@@ -39,7 +40,7 @@ class DirState
    // quota info, enabled?
 
    int          m_depth;
-   int          m_max_depth;
+   int          m_max_depth;    // XXXX-CKSUM Do we need this? Should it be passed in to find functions?
    bool         m_stat_report;  // not used - storing of stats required
 
    typedef std::map<std::string, DirState> DsMap_t;
@@ -222,10 +223,10 @@ public:
       std::string path;
       long long   nBytes;
       time_t      time;
-      DirState   *dirState; // XXXX if this is stored, why is it not used later in purge?
+      DirState   *dirState;
 
-      FS(const std::string& p, long long n, time_t t, DirState *ds) :
-         path(p), nBytes(n), time(t), dirState(ds)
+      FS(const std::string &dname, const char *fname, long long n, time_t t, DirState *ds) :
+         path(dname + fname), nBytes(n), time(t), dirState(ds)
       {}
    };
 
@@ -244,28 +245,31 @@ public:
    long long nBytesTotal;
    time_t    tMinTimeStamp;
 
+   // XrdOss   *m_oss;
+   XrdOssAt  m_oss_at;
+
    // ------------------------------------
    // Directory handling & stat collection
    // ------------------------------------
 
    DirState    *m_dir_state;
+   std::string  m_current_path; // Includes trailing '/'
    int          m_dir_level;
-   int          m_max_dir_level_for_stat_collection; // until I honor globs from pfc.dirstats
-   std::string  m_current_dir;
-   std::string  m_current_path; // Note: without leading '/'!
+   const int    m_max_dir_level_for_stat_collection; // until we honor globs from pfc.dirstats
 
    std::vector<std::string> m_dir_names_stack;
    std::vector<long long>   m_dir_usage_stack;
 
-   void begin_traversal(DirState *root)
+   const char   *m_info_ext;
+   const size_t  m_info_ext_len;
+   XrdSysTrace  *m_trace;
+
+
+   void begin_traversal(DirState *root, const char *root_path = "/")
    {
       m_dir_state = root;
       m_dir_level = 0;
-      m_max_dir_level_for_stat_collection = Cache::GetInstance().RefConfiguration().m_dirStatsStoreDepth;
-      m_current_dir  = "";
-      m_current_path = "";
-      m_dir_names_stack.reserve(32);
-      m_dir_usage_stack.reserve(m_max_dir_level_for_stat_collection + 1);
+      m_current_path = root_path;
       m_dir_usage_stack.push_back(0);
 
       printf("FPurgeState::begin_traversal cur_path '%s', usage=%lld, level=%d\n", m_current_path.c_str(),
@@ -282,20 +286,22 @@ public:
       m_dir_state = 0;
    }
 
-   void cd_down(const std::string& dir_name, const std::string& full_path)
+   void cd_down(const std::string& dir_name)
    {
       ++m_dir_level;
+
       if (m_dir_level <= m_max_dir_level_for_stat_collection)
       {
          m_dir_usage_stack.push_back(0);
          m_dir_state = m_dir_state->find_dir(dir_name, true);
       }
+
       m_dir_names_stack.push_back(dir_name);
-      m_current_dir  = dir_name;
-      m_current_path = full_path;
+      m_current_path.append(dir_name);
+      m_current_path.append("/");
    }
 
-   void cd_up(const std::string& full_path)
+   void cd_up()
    {
       if (m_dir_level <= m_max_dir_level_for_stat_collection)
       {
@@ -311,8 +317,8 @@ public:
          m_dir_usage_stack.back() += tail;
       }
 
-      m_current_path = full_path;
-      m_current_dir  = m_dir_names_stack.back();
+      m_current_path.pop_back(); // remove trailing '/'
+      m_current_path.erase(m_current_path.find_last_of('/') + 1);
       m_dir_names_stack.pop_back();
 
       --m_dir_level;
@@ -321,10 +327,20 @@ public:
    // ------------------------------------------------------------------------
    // ------------------------------------------------------------------------
 
-   FPurgeState(long long iNBytesReq) :
+   FPurgeState(long long iNBytesReq, XrdOss &oss) :
       nBytesReq(iNBytesReq), nBytesAccum(0), nBytesTotal(0), tMinTimeStamp(0),
-      m_dir_state(0)
-   {}
+      // m_oss(oss),
+      m_oss_at(oss),
+      m_dir_state(0), m_dir_level(0),
+      m_max_dir_level_for_stat_collection(Cache::GetInstance().RefConfiguration().m_dirStatsStoreDepth),
+      m_info_ext(XrdPfc::Info::s_infoExtension),
+      m_info_ext_len(strlen(XrdPfc::Info::s_infoExtension)),
+      m_trace(Cache::GetInstance().GetTrace())
+   {
+      m_current_path.reserve(256);
+      m_dir_names_stack.reserve(32);
+      m_dir_usage_stack.reserve(m_max_dir_level_for_stat_collection + 1);
+  }
 
    // ------------------------------------------------------------------------
 
@@ -342,20 +358,20 @@ public:
       m_flist.clear();
    }
 
-   void checkFile(const std::string& iPath, long long iNBytes, time_t iTime)
+   void CheckFile(const char *iFile, long long iNBytes, time_t iTime)
    {
       nBytesTotal += iNBytes;
 
-      if (m_dir_state)  m_dir_usage_stack.back() += iNBytes;
+      m_dir_usage_stack.back() += iNBytes;
 
       if (tMinTimeStamp > 0 && iTime < tMinTimeStamp)
       {
-         m_flist.push_back(FS(iPath, iNBytes, iTime, m_dir_state));
+         m_flist.push_back(FS(m_current_path, iFile, iNBytes, iTime, m_dir_state));
          nBytesAccum += iNBytes;
       }
       else if (nBytesAccum < nBytesReq || ( ! m_fmap.empty() && iTime < m_fmap.rbegin()->first))
       {
-         m_fmap.insert(std::make_pair(iTime, FS(iPath, iNBytes, iTime, m_dir_state)));
+         m_fmap.insert(std::make_pair(iTime, FS(m_current_path, iFile, iNBytes, iTime, m_dir_state)));
          nBytesAccum += iNBytes;
 
          // remove newest files from map if necessary
@@ -367,100 +383,82 @@ public:
       }
    }
 
-   void FillFileMapRecurse(XrdOssDF* iOssDF, const std::string& path)
+   void TraverseNamespace(XrdOssDF *iOssDF)
    {
-      static const char* m_traceID = "Purge";
-
-      const char   *InfoExt    = XrdPfc::Info::s_infoExtension;
-      const size_t  InfoExtLen = strlen(InfoExt);
-
-      Cache        &cache = Cache::GetInstance();
-      XrdOss       *oss   = cache.GetOss();
-      const char   *uname = cache.RefConfiguration().m_username.c_str();
+      static const char *m_traceID = "Purge";
+      static const char *trc_pfx   = "FPurgeState::TraverseNamespace ";
 
       char          fname[256];
+      struct stat   fstat;
       XrdOucEnv     env;
 
-      while (iOssDF->Readdir(&fname[0], 256) >= 0)
+      std::cout << "Starting to read dir [" << m_current_path << "], iOssDF->getFD()=" << iOssDF->getFD() << ".\n";
+
+      iOssDF->StatRet(&fstat);
+
+      while (iOssDF->Readdir(fname, 256) >= 0)
       {
-         // printf("readdir [%s]\n", fname);
+         std::cout << "  Readdir [" << fname << "]\n";
 
-         std::string new_path  = path + "/"; new_path += fname;
-         size_t      fname_len = strlen(&fname[0]);
-
-         if (fname_len == 0)
-         {
-            // std::cout << "Finish read dir.[" << new_path << "] Break loop.\n";
+         if (fname[0] == 0) {
+            std::cout << "  Finished reading dir [" << m_current_path << "]. Break loop.\n";
             break;
          }
-
-         if (strncmp("..", &fname[0], 2) && strncmp(".", &fname[0], 1))
-         {
-            XrdOssDF* dh = oss->newDir (uname);
-            XrdOssDF* fh = oss->newFile(uname);
-
-            if (fname_len > InfoExtLen && strncmp(&fname[fname_len - InfoExtLen], InfoExt, InfoExtLen) == 0)
-            {
-               // Check if the file is currently opened / purge-protected is done before unlinking of the file.
-
-               Info cinfo(cache.GetTrace());
-
-               if (fh->Open(new_path.c_str(), O_RDONLY, 0600, env) == XrdOssOK && cinfo.Read(fh, new_path))
-               {
-                  bool   all_gauda = true;
-                  time_t accessTime;
-                  if ( ! cinfo.GetLatestDetachTime(accessTime))
-                  {
-                     // cinfo file does not contain any known accesses, use stat.mtime instead.
-                     TRACE(Debug, "FillFileMapRecurse() could not get access time for " << new_path << ", trying stat");
-
-                     struct stat fstat;
-                     if (oss->Stat(new_path.c_str(), &fstat) == XrdOssOK)
-                     {
-                        accessTime = fstat.st_mtime;
-                        TRACE(Dump, "FillFileMapRecurse() have access time for " << new_path << " via stat: " << accessTime);
-                     }
-                     else
-                     {
-                        // This really shouldn't happen ... but if it does remove cinfo and the data file right away.
-                        TRACE(Warning, "FillFileMapRecurse() could not get access time for " << new_path << "; purging.");
-                        oss->Unlink(new_path.c_str());
-                        new_path = new_path.substr(0, new_path.size() - strlen(InfoExt));
-                        oss->Unlink(new_path.c_str());
-                        all_gauda = false;
-                     }
-                  }
-
-                  if (all_gauda)
-                  {
-                     // TRACE(Dump, "FillFileMapRecurse() checking " << fname << " accessTime  " << accessTime);
-                     checkFile(new_path, cinfo.GetNDownloadedBytes(), accessTime);
-                  }
-               }
-               else
-               {
-                  TRACE(Warning, "FillFileMapRecurse() can't open or read " << new_path << ", err " << XrdSysE2T(errno)
-                        << "; purging.");
-                  oss->Unlink(new_path.c_str());
-                  new_path = new_path.substr(0, new_path.size() - InfoExtLen);
-                  oss->Unlink(new_path.c_str());
-               }
-            }
-            else if (dh->Opendir(new_path.c_str(), env) == XrdOssOK)
-            {
-               if (m_dir_state) cd_down(fname, new_path);
-
-               FillFileMapRecurse(dh, new_path);
-
-               if (m_dir_state) cd_up(path);
-            }
-
-            delete dh; dh = 0;
-            delete fh; fh = 0;
+         if (fname[0] == '.' && (fname[1] == 0 || (fname[1] == '.' && fname[2] == 0))) {
+            std::cout << "  Skipping here or parent dir [" << fname << "]. Continue loop.\n";
+            continue;
          }
+
+         size_t    fname_len = strlen(fname);
+         XrdOssDF *dfh       = 0;
+
+         if (S_ISDIR(fstat.st_mode))
+         {
+            if (m_oss_at.Opendir(*iOssDF, fname, env, dfh) == XrdOssOK)
+            {
+               cd_down(fname);
+               TraverseNamespace(dfh);
+               cd_up();
+            }
+            else
+               TRACE(Warning, trc_pfx << "could not opendir [" << m_current_path << fname << "], " << XrdSysE2T(errno));
+         }
+         else if (fname_len > m_info_ext_len && strncmp(&fname[fname_len - m_info_ext_len], m_info_ext, m_info_ext_len) == 0)
+         {
+            // Check if the file is currently opened / purge-protected is done before unlinking of the file.
+
+            Info cinfo(m_trace);
+
+            if (m_oss_at.OpenRO(*iOssDF, fname, env, dfh) == XrdOssOK && cinfo.Read(dfh, m_current_path.c_str(), fname))
+            {
+               time_t accessTime;
+               if ( ! cinfo.GetLatestDetachTime(accessTime))
+               {
+                  // cinfo file does not contain any known accesses, use fstat.mtime instead.
+                  TRACE(Debug, trc_pfx << "could not get access time for " << m_current_path << fname << ", using mtime from stat instead.");
+
+                  accessTime = fstat.st_mtime;
+               }
+
+               // TRACE(Dump, trc_pfx << "checking " << fname << " accessTime  " << accessTime);
+               CheckFile(fname, cinfo.GetNDownloadedBytes(), accessTime);
+            }
+            else
+            {
+               TRACE(Warning, trc_pfx << "can't open or read " << m_current_path << fname << ", err " << XrdSysE2T(errno) << "; purging.");
+               m_oss_at.Unlink(*iOssDF, fname);
+               fname[fname_len - m_info_ext_len] = 0;
+               m_oss_at.Unlink(*iOssDF, fname);
+            }
+         }
+         else // XXXX devel debug only, to be removed
+         {
+            std::cout << "  Ignoring [" << fname << "], not a dir or cinfo.\n";
+         }
+
+         delete dfh;
       }
    }
-
 };
 
 
@@ -518,7 +516,7 @@ void Cache::copy_out_active_stats_and_update_data_fs_state()
       }
    }
 
-   m_fs_state->reset_stats();
+   m_fs_state->reset_stats(); // XXXX-CKSUM rethink how to do this if we keep some purge entries for next time
 
    for (StatsMMap_i i = updates.begin(); i != updates.end(); ++i)
    {
@@ -642,7 +640,7 @@ void Cache::Purge()
    // Pause before initial run
    sleep(1);
 
-   if (m_configuration.are_dirstats_enabled()) m_fs_state = new DataFsState;
+   m_fs_state = new DataFsState;
 
    // { PathTokenizer p("/a/b/c/f.root", 2, true); p.deboog(); }
    // { PathTokenizer p("/a/b/f.root", 2, true); p.deboog(); }
@@ -723,16 +721,10 @@ void Cache::Purge()
          }
       }
 
-      bool enforce_traversal_for_usage_collection = false;
+      bool enforce_traversal_for_usage_collection = is_first;
+      // XXX Other conditions? Periodic checks?
 
-      if (m_fs_state)
-      {
-         copy_out_active_stats_and_update_data_fs_state();
-
-         enforce_traversal_for_usage_collection = is_first;
-
-         // XXX Other conditions? Periodic checks?
-      }
+      copy_out_active_stats_and_update_data_fs_state();
 
       TRACE(Debug, trc_pfx << "Precheck:");
       TRACE(Debug, "\tbytes_to_remove_disk    = " << bytesToRemove_d << " B");
@@ -746,7 +738,9 @@ void Cache::Purge()
 
       bool purge_required = (bytesToRemove > 0 || enforce_age_based_purge);
 
-      FPurgeState purgeState(2 * bytesToRemove); // prepare twice more volume than required
+      // XXXX-PurgeOpt Need to retain this state between purges so I can avoid doing
+      // the traversal more often than really needed.
+      FPurgeState purgeState(2 * bytesToRemove, *m_oss); // prepare twice more volume than required
 
       if (purge_required || enforce_traversal_for_usage_collection)
       {
@@ -758,19 +752,13 @@ void Cache::Purge()
          }
 
          XrdOssDF* dh = m_oss->newDir(m_configuration.m_username.c_str());
-         if (dh->Opendir("", env) == XrdOssOK)
+         if (dh->Opendir("/", env) == XrdOssOK)
          {
-            if (m_fs_state)
-            {
-               purgeState.begin_traversal(m_fs_state->get_root());
-            }
+            purgeState.begin_traversal(m_fs_state->get_root());
 
-            purgeState.FillFileMapRecurse(dh, "");
+            purgeState.TraverseNamespace(dh);
 
-            if (m_fs_state)
-            {
-               purgeState.end_traversal();
-            }
+            purgeState.end_traversal();
 
             dh->Close();
          }
@@ -819,7 +807,8 @@ void Cache::Purge()
       }
 
       // Dump statistcs before actual purging so maximum usage values get recorded.
-      if (m_fs_state)
+      // Should really go to gstream --- and should really go from Heartbeat.
+      if (m_configuration.is_dir_stat_reporting_on())
       {
          m_fs_state->dump_recursively();
       }
@@ -828,6 +817,7 @@ void Cache::Purge()
       {
          // Loop over map and remove files with oldest values of access time.
          struct stat fstat;
+         size_t      info_ext_len  =  strlen(Info::s_infoExtension);
          int         protected_cnt = 0;
          long long   protected_sum = 0;
          for (FPurgeState::map_i it = purgeState.m_fmap.begin(); it != purgeState.m_fmap.end(); ++it)
@@ -838,8 +828,8 @@ void Cache::Purge()
                break;
             }
 
-            std::string infoPath = it->second.path;
-            std::string dataPath = infoPath.substr(0, infoPath.size() - strlen(XrdPfc::Info::s_infoExtension));
+            std::string &infoPath = it->second.path;
+            std::string  dataPath = infoPath.substr(0, infoPath.size() - info_ext_len);
 
             if (IsFileActiveOrPurgeProtected(dataPath))
             {
@@ -872,24 +862,18 @@ void Cache::Purge()
                m_oss->Unlink(dataPath.c_str());
                TRACE(Dump, trc_pfx << "Removed file: '" << dataPath << "' size: " << it->second.nBytes << ", time: " << it->first);
 
-               if (m_fs_state)
-               {
-                  DirState *ds = m_fs_state->find_dirstate_for_lfn(dataPath);
-                  if (ds != 0)
-                     ds->add_usage_purged(it->second.nBytes);
-                  else
-                     TRACE(Error, trc_pfx << "Failed finding DirState for file '" << dataPath << "'.");
-               }
+               if (it->second.dirState != 0) // XXXX-CKSUM this should now always be true.
+                  it->second.dirState->add_usage_purged(it->second.nBytes);
+               else
+                  TRACE(Error, trc_pfx << "DirState not set for file '" << dataPath << "'.");
             }
          }
          if (protected_cnt > 0)
          {
             TRACE(Info, trc_pfx << "Encountered " << protected_cnt << " protected files, sum of their size: " << protected_sum);
          }
-         if (m_fs_state)
-         {
-            m_fs_state->upward_propagate_usage_purged();
-         }
+
+         m_fs_state->upward_propagate_usage_purged();
       }
 
       {
@@ -911,40 +895,5 @@ void Cache::Purge()
       }
    }
 }
-
-
-//==============================================================================
-// DirStats specific stuff
-//==============================================================================
-
-/*
-
-  RRDtool DB sketch
-
-  # --start is not needed, default is "now - 10s"
-
-  rrdtool create <dirname>.crrd --step <purge_interval> \
-     DS:open_events:ABSOLUTE:<2*purge_interval>:0:1000 \
-     DS:access_duration:ABSOLUTE:<2*purge_interval>:0:1000000 \
-     DS:bytes_disk:ABSOLUTE:<2*purge_interval>:0:100000000000 \
-     DS:bytes_fetch:ABSOLUTE:<2*purge_interval>:0:100000000000 \
-     DS:bytes_bypass:ABSOLUTE:<2*purge_interval>:0:100000000000 \
-     DS:bytes_served:COMPUTE:bytes_disk,bytes_fetch,bytes_bypass,+,+ \
-     RRA:AVERAGE:0.5:<purge_interval>s:1w \
-     RRA:AVERAGE:0.5:1h:1M \
-     RRA:AVERAGE:0.5:1d:1y \
-
-  Questions / Issues:
-  1. DS min / max -- are they for values after division or before?
-     I'm assuming after in the above.
-  2. What is xxf (argument to RRA)? The thing that is usually 0.5.
-     Ah, xfiles factor, how much can be unknown for consolidated value to eb known.
-  3. Use COMPUTE for bytes_served (sum of the others).
-     ARGH, can not change heartbeat for COMPUTE, will pass it in manually.
-  4. Use rddtool tune -h to change heartbeat on start (if different, maybe).
-
-  5. ADD disk_usage !!!!
-     DS:disk_usage:GAUGE:...
- */
 
 } // end XrdPfc namespace

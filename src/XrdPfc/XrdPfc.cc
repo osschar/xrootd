@@ -192,9 +192,7 @@ Cache::Cache(XrdSysLogger *logger, XrdOucEnv *env) :
    m_RAM_used(0),
    m_RAM_write_queue(0),
    m_RAM_std_size(0),
-   m_csUVKeep(-1),
    m_isClient(false),
-   m_csChk(csChk_Net|csChk_TLS),
    m_in_purge(false),
    m_active_cond(0),
    m_stats_n_purge_cond(0),
@@ -219,11 +217,11 @@ XrdOucCacheIO *Cache::Attach(XrdOucCacheIO *io, int Options)
 
       if (Cache::GetInstance().RefConfiguration().m_hdfsmode)
       {
-         cio = new IOFileBlock(io, m_ouc_stats, *this);
+         cio = new IOFileBlock(io, *this);
       }
       else
       {
-         IOEntireFile *ioef = new IOEntireFile(io, m_ouc_stats, *this);
+         IOEntireFile *ioef = new IOEntireFile(io, *this);
 
          if ( ! ioef->HasFile())
          {
@@ -627,47 +625,45 @@ void Cache::dec_ref_cnt(File* f, bool high_debug)
    }
 
    {
-     XrdSysCondVarHelper lock(&m_active_cond);
+      XrdSysCondVarHelper lock(&m_active_cond);
 
-     cnt = f->dec_ref_cnt();
-     TRACE_INT(tlvl, "Cache::dec_ref_cnt " << f->GetLocalPath() << ", cnt after sync_check and dec_ref_cnt = " << cnt);
-     if (cnt == 0)
-     {
-        ActiveMap_i it = m_active.find(f->GetLocalPath());
-        m_active.erase(it);
+      cnt = f->dec_ref_cnt();
+      TRACE_INT(tlvl, "Cache::dec_ref_cnt " << f->GetLocalPath() << ", cnt after sync_check and dec_ref_cnt = " << cnt);
+      if (cnt == 0)
+      {
+         ActiveMap_i it = m_active.find(f->GetLocalPath());
+         m_active.erase(it);
 
-        if (m_configuration.are_dirstats_enabled())
-        {
-           m_closed_files_stats.insert(std::make_pair(f->GetLocalPath(), f->DeltaStatsFromLastCall()));
-        }
+         m_closed_files_stats.insert(std::make_pair(f->GetLocalPath(), f->DeltaStatsFromLastCall()));
 
-        if (m_gstream)
-        {
-           const Info::AStat *as = f->GetLastAccessStats();
+         if (m_gstream)
+         {
+            const Info::AStat *as = f->GetLastAccessStats();
 
-           char buf[4096];
-           int  len = snprintf(buf, 4096, "{\"event\":\"file_close\","
-                               "\"lfn\":\"%s\",\"size\":%lld,\"blk_size\":%d,\"n_blks\":%d,\"n_blks_done\":%d,"
-                               "\"access_cnt\":%lu,\"attach_t\":%lld,\"detach_t\":%lld,"
-                               "\"b_hit\":%lld,\"b_miss\":%lld,\"b_bypass\":%lld}",
-                               f->GetLocalPath().c_str(), f->GetFileSize(), f->GetBlockSize(),
-                               f->GetNBlocks(), f->GetNDownloadedBlocks(),
-                               (unsigned long) f->GetAccessCnt(), (long long) as->AttachTime, (long long) as->DetachTime,
-                               as->BytesHit, as->BytesMissed, as->BytesBypassed
-           );
-           bool suc = false;
-           if (len < 4096)
-           {
-              suc = m_gstream->Insert(buf, len + 1);
-           }
-           if ( ! suc)
-           {
-              TRACE(Error, "Failed g-stream insertion of file_close record.");
-           }
-        }
+            char buf[4096];
+            int  len = snprintf(buf, 4096, "{\"event\":\"file_close\","
+                                 "\"lfn\":\"%s\",\"size\":%lld,\"blk_size\":%d,\"n_blks\":%d,\"n_blks_done\":%d,"
+                                 "\"access_cnt\":%lu,\"attach_t\":%lld,\"detach_t\":%lld,\"remotes\":%s,"
+                                 "\"b_hit\":%lld,\"b_miss\":%lld,\"b_bypass\":%lld}",
+                                 f->GetLocalPath().c_str(), f->GetFileSize(), f->GetBlockSize(),
+                                 f->GetNBlocks(), f->GetNDownloadedBlocks(),
+                                 (unsigned long) f->GetAccessCnt(), (long long) as->AttachTime, (long long) as->DetachTime,
+                                 f->GetRemoteLocations().c_str(),
+                                 as->BytesHit, as->BytesMissed, as->BytesBypassed
+            );
+            bool suc = false;
+            if (len < 4096)
+            {
+               suc = m_gstream->Insert(buf, len + 1);
+            }
+            if ( ! suc)
+            {
+               TRACE(Error, "Failed g-stream insertion of file_close record, len=" << len);
+            }
+         }
 
-        delete f;
-     }
+         delete f;
+      }
    }
 }
 
@@ -814,7 +810,7 @@ int Cache::LocalFilePath(const char *curl, char *buff, int blen,
    if (m_oss->Stat(f_name.c_str(), &sbuff)  == XrdOssOK &&
        m_oss->Stat(i_name.c_str(), &sbuff2) == XrdOssOK)
    {
-      if ( S_ISDIR(sbuff.st_mode))
+      if (S_ISDIR(sbuff.st_mode))
       {
          TRACE(Info, "Cache::LocalFilePath '" << curl << "', why=" << lfpReason[why] << " -> EISDIR");
          return -EISDIR;
@@ -824,10 +820,15 @@ int Cache::LocalFilePath(const char *curl, char *buff, int blen,
          bool read_ok     = false;
          bool is_complete = false;
 
-         // Lock and check if file is active. If NOT, keep the lock
+         // Lock and check if the file is active. If NOT, keep the lock
          // and add dummy access after successful reading of info file.
          // If it IS active, just release the lock, this ongoing access will
          // assure the file continues to exist.
+
+         // XXXX-CKSUM WTH how can I just oop over the cinfo file when active?
+         // Can I not get is_complete from the existing file?
+         // Do I still want to inject access record?
+         // Oh, it writes only if not active .... still let's try to use existing File.
 
          m_active_cond.Lock();
 
@@ -841,7 +842,7 @@ int Cache::LocalFilePath(const char *curl, char *buff, int blen,
          if (res >= 0)
          {
             Info info(m_trace, 0);
-            if (info.Read(infoFile, i_name))
+            if (info.Read(infoFile, i_name.c_str()))
             {
                read_ok = true;
 
@@ -851,7 +852,7 @@ int Cache::LocalFilePath(const char *curl, char *buff, int blen,
                if ( ! is_active && is_complete && why == ForAccess)
                {
                   info.WriteIOStatSingle(info.GetFileSize());
-                  info.Write(infoFile);
+                  info.Write(infoFile, i_name.c_str());
                }
             }
             infoFile->Close();
@@ -873,7 +874,7 @@ int Cache::LocalFilePath(const char *curl, char *buff, int blen,
                if (why == ForAccess)
                   {mode_t mode = (forall ? worldReadable : groupReadable);
                    if (((sbuff.st_mode & worldReadable) != mode)
-                   &&  (m_oss->Chmod(f_name.c_str(),mode) != XrdOssOK))
+                   &&  (m_oss->Chmod(f_name.c_str(), mode) != XrdOssOK))
                       {is_complete = false;
                        *buff = 0;
                       }
@@ -959,7 +960,6 @@ int Cache::Stat(const char *curl, struct stat &sbuff)
 {
    XrdCl::URL url(curl);
    std::string f_name = url.GetPath();
-   std::string i_name = f_name + Info::s_infoExtension;
 
    {
       XrdSysCondVarHelper lock(&m_active_cond);
@@ -977,11 +977,13 @@ int Cache::Stat(const char *curl, struct stat &sbuff)
          bool success = false;
          XrdOssDF* infoFile = m_oss->newFile(m_configuration.m_username.c_str());
          XrdOucEnv myEnv;
-         int res = infoFile->Open(i_name.c_str(), O_RDONLY, 0600, myEnv);
+
+         f_name += Info::s_infoExtension;
+         int res = infoFile->Open(f_name.c_str(), O_RDONLY, 0600, myEnv);
          if (res >= 0)
          {
             Info info(m_trace, 0);
-            if (info.Read(infoFile, i_name))
+            if (info.Read(infoFile, f_name.c_str()))
             {
                sbuff.st_size = info.GetFileSize();
                success = true;

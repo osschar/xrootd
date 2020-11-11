@@ -32,14 +32,12 @@
 using namespace XrdPfc;
 
 //______________________________________________________________________________
-IOEntireFile::IOEntireFile(XrdOucCacheIO *io, XrdOucCacheStats &stats, Cache & cache) :
-   IO(io, stats, cache),
+IOEntireFile::IOEntireFile(XrdOucCacheIO *io, Cache & cache) :
+   IO(io, cache),
    m_file(0),
    m_localStat(0)
 {
-   XrdCl::URL  url(GetInput()->Path());
-   std::string fname = url.GetPath();
-   m_file = Cache::GetInstance().GetFile(fname, this);
+   m_file = Cache::GetInstance().GetFile(GetFilename(), this);
 }
 
 //______________________________________________________________________________
@@ -55,9 +53,7 @@ IOEntireFile::~IOEntireFile()
 //______________________________________________________________________________
 int IOEntireFile::Fstat(struct stat &sbuff)
 {
-   XrdCl::URL  url(GetPath());
-   std::string name = url.GetPath();
-   name += Info::s_infoExtension;
+   std::string name = GetFilename() + Info::s_infoExtension;
 
    int res = 0;
    if( ! m_localStat)
@@ -129,8 +125,16 @@ int IOEntireFile::initCachedStat(const char* path)
 }
 
 //______________________________________________________________________________
+void IOEntireFile::Update(XrdOucCacheIO &iocp)
+{
+   IO::Update(iocp);
+   m_file->ioUpdated(this);
+}
+
+//______________________________________________________________________________
 bool IOEntireFile::ioActive()
 {
+   RefreshLocation();
    return m_file->ioActive(this);
 }
 
@@ -195,4 +199,3 @@ int IOEntireFile::ReadV(const XrdOucIOVec *readV, int n)
    TRACEIO(Dump, "IO::ReadV(), get " <<  n << " requests" );
    return m_file->ReadV(this, readV, n);
 }
-
