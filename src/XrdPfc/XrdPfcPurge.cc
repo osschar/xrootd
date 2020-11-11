@@ -317,8 +317,8 @@ public:
          m_dir_usage_stack.back() += tail;
       }
 
-      m_current_path.pop_back(); // remove trailing '/'
-      m_current_path.erase(m_current_path.find_last_of('/') + 1);
+      // remove trailing / and last dir but keep the new trailing / in place.
+      m_current_path.erase(m_current_path.find_last_of('/', m_current_path.size() - 2) + 1);
       m_dir_names_stack.pop_back();
 
       --m_dir_level;
