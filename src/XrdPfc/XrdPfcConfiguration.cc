@@ -2,6 +2,9 @@
 #include "XrdPfcTrace.hh"
 #include "XrdPfcInfo.hh"
 
+#include "XrdPfcResourceMonitor.hh"
+#include "XrdPfcPurgePin.hh"
+
 #include "XrdOss/XrdOss.hh"
 
 #include "XrdOuc/XrdOucEnv.hh"
@@ -228,6 +231,59 @@ bool Cache::xdlib(XrdOucStream &Config)
    return true;
 }
 
+/* Function: xplib
+
+   Purpose:  To parse the directive: purgelib <path> [<parms>]
+
+             <path>  the path of the decision library to be used.
+             <parms> optional parameters to be passed.
+
+
+   Output: true upon success or false upon failure.
+ */
+bool Cache::xplib(XrdOucStream &Config)
+{
+   const char*  val;
+
+   std::string libp;
+   if (! (val = Config.GetWord()) || ! val[0])
+   {
+      TRACE(Info," Cache::Config() purgelib not specified; will use LRU for purging files");
+      return true;
+   }
+   else
+   {
+      libp = val;
+   }
+
+   char params[4096];
+   if (val[0])
+      Config.GetRest(params, 4096);
+   else
+      params[0] = 0;
+
+   XrdOucPinLoader* myLib = new XrdOucPinLoader(&m_log, 0, "purgelib",
+                                                libp.c_str());
+
+   PurgePin *(*ep)(XrdSysError&);
+   ep = (PurgePin *(*)(XrdSysError&))myLib->Resolve("XrdPfcGetPurgePin");
+   if (! ep) {myLib->Unload(true); return false; }
+
+   PurgePin * dp = ep(m_log);
+   if (! dp)
+   {
+      TRACE(Error, "Config() purgelib was not able to create a Purge Plugin object?");
+      return false;
+   }
+   m_purge_pin = dp;
+
+   if (params[0])
+      m_purge_pin->ConfigPurgePin(params);
+
+
+   return true;
+}
+
 /* Function: xtrace
 
    Purpose:  To parse the directive: trace <level>
@@ -334,6 +390,10 @@ bool Cache::Config(const char *config_filename, const char *parameters)
       {
          retval = xdlib(Config);
       }
+      else if (! strcmp(var,"pfc.purgelib"))
+      {
+         retval = xplib(Config);
+      }
       else if (! strcmp(var,"pfc.trace"))
       {
          retval = xtrace(Config);
@@ -382,6 +442,18 @@ bool Cache::Config(const char *config_filename, const char *parameters)
    // sets default value for disk usage
    XrdOssVSInfo sP;
    {
+      if (m_configuration.m_meta_space != m_configuration.m_data_space &&
+          m_oss->StatVS(&sP, m_configuration.m_meta_space.c_str(), 1) < 0)
+      {
+         m_log.Emsg("ConfigParameters()", "error obtaining stat info for meta space ", m_configuration.m_meta_space.c_str());
+         return false;
+      }
+      if (m_configuration.m_meta_space != m_configuration.m_data_space && sP.Total < 10ll << 20)
+      {
+         m_log.Emsg("ConfigParameters()", "available data space is less than 10 MB (can be due to a mistake in oss.localroot directive) for space ",
+                    m_configuration.m_meta_space.c_str());
+                    return false;
+      }
       if (m_oss->StatVS(&sP, m_configuration.m_data_space.c_str(), 1) < 0)
       {
          m_log.Emsg("ConfigParameters()", "error obtaining stat info for data space ", m_configuration.m_data_space.c_str());
@@ -419,6 +491,13 @@ bool Cache::Config(const char *config_filename, const char *parameters)
             m_log.Emsg("ConfigParameters()", "pfc.diskusage files should have baseline < nominal < max.");
             aOK = false;
           }
+
+
+         if (aOK && m_configuration.m_fileUsageMax >= m_configuration.m_diskUsageLWM)
+         {
+            m_log.Emsg("ConfigParameters()", "pfc.diskusage files values must be below lowWatermark");
+            aOK = false;
+         }
         }
         else aOK = false;
       }
@@ -456,7 +535,7 @@ bool Cache::Config(const char *config_filename, const char *parameters)
    }
    // Setup number of standard-size blocks not released back to the system to 5% of total RAM.
    m_configuration.m_RamKeepStdBlocks = (m_configuration.m_RamAbsAvailable / m_configuration.m_bufferSize + 1) * 5 / 100;
-   
+
 
    // Set tracing to debug if this is set in environment
    char* cenv = getenv("XRDDEBUG");
@@ -552,9 +631,16 @@ bool Cache::Config(const char *config_filename, const char *parameters)
 
    m_gstream = (XrdXrootdGStream*) m_env->GetPtr("pfc.gStream*");
 
-   m_log.Say("Config Proxy File Cache g-stream has", m_gstream ? "" : " NOT", " been configured via xrootd.monitor directive");
+   m_log.Say("       pfc g-stream has", m_gstream ? "" : " NOT", " been configured via xrootd.monitor directive\n");
 
-   m_log.Say("------ Proxy File Cache configuration parsing ", aOK ? "completed" : "failed");
+   // Create the ResourceMonitor and get it ready for starting the main thread function.
+   if (aOK)
+   {
+      m_res_mon = new ResourceMonitor(*m_oss);
+      m_res_mon->init_before_main();
+   }
+
+   m_log.Say("=====> Proxy file cache configuration parsing ", aOK ? "completed" : "failed");
 
    if (ofsCfg) delete ofsCfg;
 

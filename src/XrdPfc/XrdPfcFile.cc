@@ -18,21 +18,23 @@
 
 
 #include "XrdPfcFile.hh"
+#include "XrdPfc.hh"
+#include "XrdPfcResourceMonitor.hh"
 #include "XrdPfcIO.hh"
 #include "XrdPfcTrace.hh"
-#include <cstdio>
-#include <sstream>
-#include <fcntl.h>
-#include <assert.h>
+
 #include "XrdCl/XrdClLog.hh"
 #include "XrdCl/XrdClConstants.hh"
 #include "XrdCl/XrdClFile.hh"
-#include "XrdSys/XrdSysPthread.hh"
 #include "XrdSys/XrdSysTimer.hh"
 #include "XrdOss/XrdOss.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdSfs/XrdSfsInterface.hh"
-#include "XrdPfc.hh"
+
+#include <cstdio>
+#include <sstream>
+#include <fcntl.h>
+#include <cassert>
 
 
 using namespace XrdPfc;
@@ -67,6 +69,7 @@ File::File(const std::string& path, long long iOffset, long long iFileSize) :
    m_state_cond(0),
    m_block_size(0),
    m_num_blocks(0),
+   m_resmon_token(-1),
    m_prefetch_state(kOff),
    m_prefetch_read_cnt(0),
    m_prefetch_hit_cnt(0),
@@ -80,7 +83,7 @@ File::~File()
       TRACEF(Debug, "~File() close info ");
       m_info_file->Close();
       delete m_info_file;
-      m_info_file = NULL;
+      m_info_file = nullptr;
    }
 
    if (m_data_file)
@@ -88,7 +91,13 @@ File::~File()
       TRACEF(Debug, "~File() close output  ");
       m_data_file->Close();
       delete m_data_file;
-      m_data_file = NULL;
+      m_data_file = nullptr;
+   }
+
+   if (m_resmon_token >= 0)
+   {
+      // Last update of file stats has been sent from the final Sync.
+      Cache::ResMon().register_file_close(m_resmon_token, time(0), m_stats);
    }
 
    TRACEF(Debug, "~File() ended, prefetch score = " <<  m_prefetch_score);
@@ -134,22 +143,28 @@ void File::initiate_emergency_shutdown()
          cache()->DeRegisterPrefetchFile(this);
       }
    }
-
 }
 
 //------------------------------------------------------------------------------
 
-Stats File::DeltaStatsFromLastCall()
+void File::check_delta_stats()
 {
-   // Not locked, only used from Cache / Purge thread.
+   // Called under m_state_cond lock.
+   // BytesWritten indirectly trigger an unconditional merge through periodic Sync().
+   if (m_delta_stats.BytesRead() >= m_resmon_report_threshold)
+      report_and_merge_delta_stats();
+}
 
-   Stats delta = m_last_stats;
-
-   m_last_stats = m_stats.Clone();
-
-   delta.DeltaToReference(m_last_stats);
-
-   return delta;
+void File::report_and_merge_delta_stats()
+{
+   // Called under m_state_cond lock.
+   struct stat s;
+   m_data_file->Fstat(&s);
+   m_delta_stats.m_StBlocksAdded = s.st_blocks - m_st_blocks;
+   m_st_blocks = s.st_blocks;
+   Cache::ResMon().register_file_update_stats(m_resmon_token, m_delta_stats);
+   m_stats.AddUp(m_delta_stats);
+   m_delta_stats.Reset();
 }
 
 //------------------------------------------------------------------------------
@@ -278,8 +293,8 @@ bool File::FinalizeSyncBeforeExit()
    {
      if ( ! m_writes_during_sync.empty() || m_non_flushed_cnt > 0 || ! m_detach_time_logged)
      {
-       Stats loc_stats = m_stats.Clone();
-       m_cfi.WriteIOStatDetach(loc_stats);
+       report_and_merge_delta_stats();
+       m_cfi.WriteIOStatDetach(m_stats);
        m_detach_time_logged = true;
        m_in_sync            = true;
        TRACEF(Debug, "FinalizeSyncBeforeExit requesting sync to write detach stats");
@@ -309,7 +324,7 @@ void File::AddIO(IO *io)
    {
       m_io_set.insert(io);
       io->m_attach_time = now;
-      m_stats.IoAttach();
+      m_delta_stats.IoAttach();
 
       insert_remote_location(loc);
 
@@ -348,7 +363,7 @@ void File::RemoveIO(IO *io)
          ++m_current_io;
       }
 
-      m_stats.IoDetach(now - io->m_attach_time);
+      m_delta_stats.IoDetach(now - io->m_attach_time);
       m_io_set.erase(mi);
       --m_ios_in_detach;
 
@@ -375,7 +390,11 @@ bool File::Open()
 
    static const char *tpfx = "Open() ";
 
-   TRACEF(Dump, tpfx << "open file for disk cache");
+   TRACEF(Dump, tpfx << "entered");
+
+   // Before touching anything, check with ResourceMonitor if a scan is in progress.
+   // This function will wait internally if needed until it is safe to proceed.
+   Cache::ResMon().CrossCheckIfScanIsInProgress(m_filename, m_state_cond);
 
    const Configuration &conf = Cache::GetInstance().RefConfiguration();
 
@@ -412,7 +431,7 @@ bool File::Open()
       return false;
    }
 
-   myEnv.Put("oss.asize", "64k"); // TODO: Calculate? Get it from configuration? Do not know length of access lists ...
+   myEnv.Put("oss.asize", "64k"); // Advisory, block-map and access list lengths vary.
    myEnv.Put("oss.cgroup", conf.m_meta_space.c_str());
    if ((res = myOss.Create(myUser, ifn.c_str(), 0600, myEnv, XRDOSS_mkpath)) != XrdOssOK)
    {
@@ -448,6 +467,7 @@ bool File::Open()
          TRACEF(Warning, tpfx << "Basic sanity checks on data file failed, resetting info file, truncating data file.");
          m_cfi.ResetAllAccessStats();
          m_data_file->Ftruncate(0);
+         Cache::ResMon().register_file_purge(m_filename, data_stat.st_blocks);
       }
    }
 
@@ -460,6 +480,7 @@ bool File::Open()
          initialize_info_file = true;
          m_cfi.ResetAllAccessStats();
          m_data_file->Ftruncate(0);
+         Cache::ResMon().register_file_purge(m_filename, data_stat.st_blocks);
       } else {
          // TODO: If the file is complete, we don't need to reset net cksums.
          m_cfi.DowngradeCkSumState(conf.get_cs_Chk());
@@ -475,12 +496,27 @@ bool File::Open()
       m_info_file->Fsync();
       TRACEF(Debug, tpfx << "Creating new file info, data size = " <<  m_file_size << " num blocks = "  << m_cfi.GetNBlocks());
    }
+   else
+   {
+      if (futimens(m_info_file->getFD(), NULL)) {
+         TRACEF(Error, tpfx << "failed setting modification time " << ERRNO_AND_ERRSTR(errno));
+      }
+   }
 
    m_cfi.WriteIOStatAttach();
    m_state_cond.Lock();
    m_block_size = m_cfi.GetBufferSize();
    m_num_blocks = m_cfi.GetNBlocks();
    m_prefetch_state = (m_cfi.IsComplete()) ? kComplete : kStopped; // Will engage in AddIO().
+
+   m_data_file->Fstat(&data_stat);
+   m_st_blocks = data_stat.st_blocks;
+
+   m_resmon_token = Cache::ResMon().register_file_open(m_filename, time(0), data_existed);
+   m_resmon_report_threshold = std::min(std::max(200ll * 1024, m_file_size / 50), 500ll * 1024 * 1024);
+   // m_resmon_report_threshold_scaler; // something like 10% of original threshold, to adjust
+   // actual threshold based on return values from register_file_update_stats().
+
    m_state_cond.UnLock();
 
    return true;
@@ -672,7 +708,11 @@ int File::Read(IO *io, char* iUserBuff, long long iUserOff, int iUserSize, ReadR
    {
       m_state_cond.UnLock();
       int ret = m_data_file->Read(iUserBuff, iUserOff, iUserSize);
-      if (ret > 0) m_stats.AddBytesHit(ret);
+      if (ret > 0) {
+         XrdSysCondVarHelper _lck(m_state_cond);
+         m_delta_stats.AddBytesHit(ret);
+         check_delta_stats();
+      }
       return ret;
    }
 
@@ -701,7 +741,11 @@ int File::ReadV(IO *io, const XrdOucIOVec *readV, int readVnum, ReadReqRH *rh)
    {
       m_state_cond.UnLock();
       int ret = m_data_file->ReadV(const_cast<XrdOucIOVec*>(readV), readVnum);
-      if (ret > 0) m_stats.AddBytesHit(ret);
+      if (ret > 0) {
+         XrdSysCondVarHelper _lck(m_state_cond);
+         m_delta_stats.AddBytesHit(ret);
+         check_delta_stats();
+      }
       return ret;
    }
 
@@ -930,9 +974,9 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
       if (read_req->is_complete())
       {
          // Almost like FinalizeReadRequest(read_req) -- but no callout!
+         m_delta_stats.AddReadStats(read_req->m_stats);
+         check_delta_stats();
          m_state_cond.UnLock();
-
-         m_stats.AddReadStats(read_req->m_stats);
 
          int ret = read_req->return_value();
          delete read_req;
@@ -946,7 +990,8 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
    }
    else
    {
-      m_stats.m_BytesHit += bytes_read;
+      m_delta_stats.m_BytesHit += bytes_read;
+      check_delta_stats();
       m_state_cond.UnLock();
 
       // !!! No callout.
@@ -1051,7 +1096,12 @@ void File::Sync()
    bool errorp = false;
    if (ret == XrdOssOK)
    {
-      Stats loc_stats = m_stats.Clone();
+      Stats loc_stats;
+      {
+         XrdSysCondVarHelper _lck(&m_state_cond);
+         report_and_merge_delta_stats();
+         loc_stats = m_stats;
+      }
       m_cfi.WriteIOStat(loc_stats);
       m_cfi.Write(m_info_file, m_filename.c_str());
       int cret = m_info_file->Fsync();
@@ -1265,8 +1315,11 @@ void File::FinalizeReadRequest(ReadRequest *rreq)
 {
    // called from ProcessBlockResponse()
    // NOT under lock -- does callout
-
-   m_stats.AddReadStats(rreq->m_stats);
+   {
+      XrdSysCondVarHelper _lck(m_state_cond);
+      m_delta_stats.AddReadStats(rreq->m_stats);
+      check_delta_stats();
+   }
 
    rreq->m_rh->Done(rreq->return_value());
    delete rreq;
@@ -1335,7 +1388,8 @@ void File::ProcessBlockResponse(Block *b, int res)
       {
          // Increase ref-count for the writer.
          inc_ref_count(b);
-         m_stats.AddWriteStats(b->get_size(), b->get_n_cksum_errors());
+         m_delta_stats.AddWriteStats(b->get_size(), b->get_n_cksum_errors());
+         // No check for writes, report-and-merge forced during Sync().
          cache()->AddWriteTask(b, true);
       }
 
