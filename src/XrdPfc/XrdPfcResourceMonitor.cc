@@ -43,6 +43,8 @@ ResourceMonitor::~ResourceMonitor()
 // Initial scan
 //------------------------------------------------------------------------------
 
+// Out-of-band processing of directories where file-open requests come in during the scan
+
 void ResourceMonitor::CrossCheckIfScanIsInProgress(const std::string &lfn, XrdSysCondVar &cond)
 {
    m_dir_scan_mutex.Lock();
@@ -101,18 +103,43 @@ void ResourceMonitor::cross_check_or_process_oob_lfn(const std::string &lfn, FsT
    {
       fst.slurp_dir_ll(*dhp, ds->m_depth, dir.c_str(), trc_pfx);
 
-      // XXXX clone of function below .... move somewhere? Esp. removal of non-paired files?
-      DirUsage &here = ds->m_here_usage;
-      for (auto it = fst.m_current_files.begin(); it != fst.m_current_files.end(); ++it)
-      {
-         if (it->second.has_data && it->second.has_cinfo) {
-            here.m_StBlocks += it->second.stat_data.st_blocks;
-            here.m_NFiles   += 1;
-         }
-      }
+      scan_files_in_current_directory(fst);
    }
    delete dhp;
    ds->m_scanned = true;
+}
+
+// File-system scanning
+
+void ResourceMonitor::scan_files_in_current_directory(FsTraversal &fst)
+{
+   DirUsage &here = fst.m_dir_state->m_here_usage;
+   for (auto it = fst.m_current_files.begin(); it != fst.m_current_files.end(); ++it)
+   {
+      dprintf("would be doing something with %s ... has_data=%d, has_cinfo=%d\n",
+            it->first.c_str(), it->second.has_data, it->second.has_cinfo);
+
+      // Remove files that do not have both cinfo and data?
+      // Count data-only into the disk usage?
+
+      // During the initial scan we count in all data-files, even if they do not
+      // have the matching cinfo file. As this can be the result of an administrative
+      // error (non-mounted disk, configuration mistake) they are not removed at this
+      // point. Instead, they are removed after 8 hours during the purge traversal.
+      // As those files can be reached with open/evict requests, they will not
+      // necessarily remain on disk until then; also, the purge records will be issued for
+      // them during the above operations.
+      // To maintain consistency of DirStats we have to include them in the directory tally.
+      // Still, we accumulate number of such cases so that a summary warning can be reported
+      // at the end of traversal.
+
+      if (it->second.has_data) {
+         here.m_StBlocks += it->second.stat_data.st_blocks;
+         here.m_NFiles   += 1;
+      }
+      if ( ! it->second.has_data)  ++fst.m_n_orphaned_data_files;
+      if ( ! it->second.has_cinfo) ++fst.m_n_orphaned_cinfo_files;
+   }
 }
 
 void ResourceMonitor::scan_dir_and_recurse(FsTraversal &fst)
@@ -125,23 +152,7 @@ void ResourceMonitor::scan_dir_and_recurse(FsTraversal &fst)
    // OOB open file request.
    if ( ! fst.m_dir_state->m_scanned)
    {
-      DirUsage &here = fst.m_dir_state->m_here_usage;
-      for (auto it = fst.m_current_files.begin(); it != fst.m_current_files.end(); ++it)
-      {
-         dprintf("would be doing something with %s ... has_data=%d, has_cinfo=%d\n",
-               it->first.c_str(), it->second.has_data, it->second.has_cinfo);
-
-         // XXX Make some of these optional?
-         // Remove files that do not have both cinfo and data?
-         // Remove empty directories before even descending?
-         // Leave this for some consistency pass?
-         // Note that FsTraversal supports ignored paths ... some details (config, N2N) to be clarified.
-
-         if (it->second.has_data && it->second.has_cinfo) {
-            here.m_StBlocks += it->second.stat_data.st_blocks;
-            here.m_NFiles   += 1;
-         }
-      }
+      scan_files_in_current_directory(fst);
       fst.m_dir_state->m_scanned = true;
    }
 
@@ -214,6 +225,13 @@ bool ResourceMonitor::perform_initial_scan()
    m_current_usage_in_st_blocks = root_ds->m_here_usage.m_StBlocks + 
                                   root_ds->m_recursive_subdir_usage.m_StBlocks;
    update_vs_and_file_usage_info();
+
+   if fst.m_n_orphaned_data_files or fst.m_n_orphaned_cinfo_files is non-zero
+   {
+      Setup timer / time at which to purge mis-matched files.
+      Warning about this and when it will be wiped
+      Also mention that frm_admin audit should be run.
+   }
 
    return true;
 }
@@ -646,7 +664,7 @@ long long ResourceMonitor::get_file_usage_bytes_to_remove(const DataFsPurgeshot 
    }
 
    // file quota and total disk usage is within normal range, check if this space usage is
-   // proportinal to disk usage and correct it
+   // proportional to disk usage and correct it
    if (u > w1 && x > f1)
    {
       float frac_u = static_cast<float>(u - w1) / (w2 - w1);

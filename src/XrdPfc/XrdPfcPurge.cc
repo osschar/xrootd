@@ -141,7 +141,7 @@ void OldStylePurgeDriver(DataFsPurgeshot &ps)
    /// Default purge
    /////////////////////////////////////////////////////////////
 
-   // check if the default pargue is still needed after purge pin
+   // check if the default purge is still needed after purge pin
    long long pin_removed_bytes = std_blocks_removed_by_pin * 512ll;
    long long default_purge_blocks_removed = 0;
    if (ps.m_bytes_to_remove > pin_removed_bytes)

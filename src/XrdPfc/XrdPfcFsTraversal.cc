@@ -59,6 +59,9 @@ bool FsTraversal::begin_traversal(const char *root_path)
    m_rel_dir_level = 0;
    m_current_path = root_path;
 
+   m_n_orphaned_data_files  = 0;
+   m_n_orphaned_cinfo_files = 0;
+
    XrdOssDF* dhp = m_oss.newDir("PfcFsTraversal");
    if (dhp->Opendir(root_path, m_env) != XrdOssOK) {
       delete dhp;

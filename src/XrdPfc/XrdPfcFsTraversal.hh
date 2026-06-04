@@ -44,6 +44,10 @@ public:
    int          m_rel_dir_level = -1; // dir level relative to root, 0 ~ at root
    std::string  m_current_path;       // Includes trailing '/' -- needed for printouts and PurgeCandidate creation.
 
+   // Counters managed by the caller, they are set to 0 in begin_traversal.
+   int m_n_orphaned_data_files  = 0;
+   int m_n_orphaned_cinfo_files = 0;
+
    // Hmmh ... need a stack of those ... or not, if doing tail recursion.
    // Can not, OpenDirAt descend can not be like that, ie, i will  need the old handle.
    std::vector<XrdOssDF*> m_dir_handle_stack;
