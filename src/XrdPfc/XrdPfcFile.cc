@@ -74,6 +74,7 @@ File::File(const std::string& path, long long iOffset, long long iFileSize) :
    m_block_size(0),
    m_num_blocks(0),
    m_max_run_blocks(1),
+   m_max_gap_blocks(0),
    m_resmon_token(-1),
    m_prefetch_state(kOff),
    m_prefetch_bytes(0),
@@ -597,6 +598,7 @@ bool File::Open(XrdOucCacheIO *inputIO)
    // A BlockRun is one remote request and one disk write. Grow runs up to the
    // configured target IO size; at or above it every run is a single block.
    m_max_run_blocks = (int) std::max(1ll, conf.m_iosize / m_block_size);
+   m_max_gap_blocks = (int) (conf.m_iogap / m_block_size);
    m_prefetch_state = (m_cfi.IsComplete()) ? kComplete : kStopped; // Will engage in AddIO().
    m_prefetch_max_blocks_in_flight = pfc_prefetch;
    if (pfc_prefetch != conf.m_prefetch_max_blocks)
@@ -1137,12 +1139,38 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
    {
       const int first = it->first;
 
-      int  n  = 1;
-      auto jt = std::next(it);
-      while (jt != to_fetch.end() && jt->first == first + n && n < m_max_run_blocks)
+      // Extend the run over consecutive indices. With pfc.iogap set, bridge
+      // over short stretches of blocks nobody asked for, turning a scattered
+      // vector read into fewer, longer requests. Only genuinely absent blocks
+      // may be bridged, so that every block of a run is uniformly "newly
+      // fetched, to be written" and the write path needs no special case.
+      int  last = first;
+      auto jt   = std::next(it);
+
+      while (jt != to_fetch.end())
       {
-         ++n; ++jt;
+         const int gap = jt->first - last - 1;
+
+         if (gap > m_max_gap_blocks)                     break;
+         if (jt->first - first + 1 > m_max_run_blocks)   break;
+
+         bool bridgeable = true;
+         for (int g = last + 1; g < jt->first; ++g)
+         {
+            if (m_block_map.find(g) != m_block_map.end() ||
+                m_cfi.TestBitWritten(offsetIdx(g)))
+            {
+               bridgeable = false;
+               break;
+            }
+         }
+         if ( ! bridgeable) break;
+
+         last = jt->first;
+         ++jt;
       }
+
+      int n = last - first + 1;
 
       BlockRun *run = PrepareBlockRun(first, n, io, read_req, false);
 
@@ -1158,10 +1186,23 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
       {
          const int n_got = run->get_n_blocks();
 
+         int n_bridged = 0;
+
          for (int k = 0; k < n_got; ++k)
          {
-            Block *b = run->m_blocks[k];
-            for (const PendingChunk &pc : to_fetch[first + k])
+            Block *b  = run->m_blocks[k];
+            auto   ci = to_fetch.find(first + k);
+
+            if (ci == to_fetch.end())
+            {
+               // Bridged block: nobody asked for its data, so it counts as
+               // prefetched and carries no chunk requests.
+               b->m_prefetch = true;
+               ++n_bridged;
+               continue;
+            }
+
+            for (const PendingChunk &pc : ci->second)
             {
                TRACEF(Dump, tpfx << "inc_ref_count new " << (void*)pc.m_buf << " idx = " << (first + k));
                inc_ref_count(b);
@@ -1170,7 +1211,8 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
             }
          }
 
-         TRACEF(DumpXL, tpfx << "new run idx " << first << " n_blocks " << n_got);
+         TRACEF(DumpXL, tpfx << "new run idx " << first << " n_blocks " << n_got <<
+                " n_bridged " << n_bridged);
 
          runs_to_request.push_back(run);
 

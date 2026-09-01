@@ -51,6 +51,7 @@ Configuration::Configuration() :
    m_dirStatsStoreDepth(1),
    m_bufferSize(128*1024),
    m_iosize(64*1024),
+   m_iogap(0),
    m_RamAbsAvailable(0),
    m_RamKeepStdBlocks(0),
    m_wqueue_blocks(16),
@@ -737,6 +738,7 @@ bool Cache::Config(const char *config_filename, const char *parameters, XrdOucEn
                  "       pfc.cschk %s uvkeep %s\n"
                  "       pfc.blocksize %lldk\n"
                  "       pfc.iosize %lldk\n"
+                 "       pfc.iogap %lldk\n"
                  "       pfc.prefetch %d\n"
                  "       pfc.urlcgi blocksize %s prefetch %s\n"
                  "       pfc.ram %.fg\n"
@@ -753,6 +755,7 @@ bool Cache::Config(const char *config_filename, const char *parameters, XrdOucEn
                  csc[int(m_configuration.m_cs_Chk)], uvk,
                  m_configuration.m_bufferSize >> 10,
                  m_configuration.m_iosize >> 10,
+                 m_configuration.m_iogap >> 10,
                  m_configuration.m_prefetch_max_blocks,
                  urlcgi_blks, urlcgi_npref,
                  ram_gb,
@@ -1044,6 +1047,17 @@ bool Cache::ConfigParameters(std::string part, XrdOucStream& config, TmpConfigur
    {
       if ( ! blocksize_str2value("Config", cwg.GetWord(), CFG.m_bufferSize,
                                  CFG.s_min_bufferSize, CFG.s_max_bufferSize))
+         return false;
+   }
+   else if ( part == "iogap" )
+   {
+      // When grouping consecutive blocks into a BlockRun, bridge over gaps of
+      // up to this many bytes of blocks that nobody asked for, so that a
+      // scattered vector read turns into fewer, longer remote requests. The
+      // bridged blocks are fetched and cached, and marked as prefetched.
+      // Larger values trade over-fetch for fewer requests; 0 disables it.
+      if ( ! blocksize_str2value("Config", cwg.GetWord(), CFG.m_iogap,
+                                 0, CFG.s_max_iogap))
          return false;
    }
    else if ( part == "iosize" )

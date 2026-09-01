@@ -112,6 +112,7 @@ struct Configuration
 
    long long m_bufferSize;              //!< cache block size, default 128 kB
    long long m_iosize;                  //!< target size of a remote request / disk write, default 64 kB
+   long long m_iogap;                   //!< bridge gaps up to this size when grouping blocks into a run, default 0 (off)
    long long m_RamAbsAvailable;         //!< available from configuration
    int       m_RamKeepStdBlocks;        //!< number of standard-sized blocks kept after release
    int       m_wqueue_blocks;           //!< maximum number of blocks written per write-queue loop
@@ -140,6 +141,8 @@ struct Configuration
 
    static constexpr long long s_min_iosize = 4 * 1024;
    static constexpr long long s_max_iosize = 512 * 1024 * 1024;
+
+   static constexpr long long s_max_iogap = 512 * 1024 * 1024;
 
    static constexpr int s_max_prefetch_max_blocks = 4096;
 

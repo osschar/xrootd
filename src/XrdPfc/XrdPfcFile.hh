@@ -453,6 +453,7 @@ private:
    long long     m_block_size;
    int           m_num_blocks;
    int           m_max_run_blocks;     //!< max blocks per BlockRun, from pfc.iosize
+   int           m_max_gap_blocks;     //!< max blocks bridged when grouping a run, from pfc.iogap
 
    // Stats and ResourceMonitor interface
 
