@@ -42,6 +42,8 @@ struct XrdVersionInfo;
 
 namespace XrdPfc
 {
+class Block;
+class BlockRun;
 class File;
 class IO;
 class PurgePin;
@@ -278,7 +280,7 @@ public:
    //---------------------------------------------------------------------
    //! Add downloaded block in write queue.
    //---------------------------------------------------------------------
-   void AddWriteTask(Block* b, bool from_read);
+   void AddWriteTask(BlockRun* run, bool from_read);
 
    //---------------------------------------------------------------------
    //!  \brief Remove blocks from write queue which belong to given prefetch.
@@ -379,7 +381,7 @@ private:
       WriteQ() : condVar(0), writes_between_purges(0), size(0) {}
 
       XrdSysCondVar     condVar;      //!< write list condVar
-      std::list<Block*> queue;        //!< container
+      std::list<BlockRun*> queue;     //!< container; one entry per block run
       long long         writes_between_purges; //!< upper bound on amount of bytes written between two purge passes
       int               size;         //!< current size of write queue
    };

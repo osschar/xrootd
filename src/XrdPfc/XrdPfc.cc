@@ -226,20 +226,21 @@ XrdOucCacheIO *Cache::Attach(XrdOucCacheIO *io, int Options)
    return io;
 }
 
-void Cache::AddWriteTask(Block* b, bool fromRead)
+void Cache::AddWriteTask(BlockRun* run, bool fromRead)
 {
-   TRACE(Dump, "AddWriteTask() offset=" <<  b->m_offset << ". file " << b->get_file()->GetLocalPath());
+   TRACE(Dump, "AddWriteTask() offset=" <<  run->m_offset << ", n_blocks=" << run->get_n_blocks() <<
+         ". file " << run->get_file()->GetLocalPath());
 
    {
       XrdSysMutexHelper lock(&m_RAM_mutex);
-      m_RAM_write_queue += b->get_size();
+      m_RAM_write_queue += run->get_data_size();
    }
 
    m_writeQ.condVar.Lock();
    if (fromRead)
-      m_writeQ.queue.push_back(b);
+      m_writeQ.queue.push_back(run);
    else
-      m_writeQ.queue.push_front(b);
+      m_writeQ.queue.push_front(run);
    m_writeQ.size++;
    m_writeQ.condVar.Signal();
    m_writeQ.condVar.UnLock();
@@ -247,19 +248,19 @@ void Cache::AddWriteTask(Block* b, bool fromRead)
 
 void Cache::RemoveWriteQEntriesFor(File *file)
 {
-   std::list<Block*> removed_blocks;
-   long long         sum_size = 0;
+   std::list<BlockRun*> removed_runs;
+   long long            sum_size = 0;
 
    m_writeQ.condVar.Lock();
-   std::list<Block*>::iterator i = m_writeQ.queue.begin();
+   std::list<BlockRun*>::iterator i = m_writeQ.queue.begin();
    while (i != m_writeQ.queue.end())
    {
       if ((*i)->m_file == file)
       {
          TRACE(Dump, "Remove entries for " <<  (void*)(*i) << " path " <<  file->lPath());
-         std::list<Block*>::iterator j = i++;
-         removed_blocks.push_back(*j);
-         sum_size += (*j)->get_size();
+         std::list<BlockRun*>::iterator j = i++;
+         removed_runs.push_back(*j);
+         sum_size += (*j)->get_data_size();
          m_writeQ.queue.erase(j);
          --m_writeQ.size;
       }
@@ -275,12 +276,12 @@ void Cache::RemoveWriteQEntriesFor(File *file)
       m_RAM_write_queue -= sum_size;
    }
 
-   file->BlocksRemovedFromWriteQ(removed_blocks);
+   file->RunsRemovedFromWriteQ(removed_runs);
 }
 
 void Cache::ProcessWriteTasks()
 {
-   std::vector<Block*> blks_to_write(m_configuration.m_wqueue_blocks);
+   std::vector<BlockRun*> runs_to_write(m_configuration.m_wqueue_blocks);
 
    while (true)
    {
@@ -290,22 +291,21 @@ void Cache::ProcessWriteTasks()
          m_writeQ.condVar.Wait();
       }
 
-      // MT -- optimize to pop several blocks if they are available (or swap the list).
-      // This makes sense especially for smallish block sizes.
+      // Pop several runs in one go, so the queue lock is taken once per batch.
 
       int       n_pushed = std::min(m_writeQ.size, m_configuration.m_wqueue_blocks);
       long long sum_size = 0;
 
       for (int bi = 0; bi < n_pushed; ++bi)
       {
-         Block* block = m_writeQ.queue.front();
+         BlockRun* run = m_writeQ.queue.front();
          m_writeQ.queue.pop_front();
-         m_writeQ.writes_between_purges += block->get_size();
-         sum_size += block->get_size();
+         m_writeQ.writes_between_purges += run->get_data_size();
+         sum_size += run->get_data_size();
 
-         blks_to_write[bi] = block;
+         runs_to_write[bi] = run;
 
-         TRACE(Dump, "ProcessWriteTasks for block " <<  (void*)(block) << " path " << block->m_file->lPath());
+         TRACE(Dump, "ProcessWriteTasks for run " <<  (void*)(run) << " path " << run->m_file->lPath());
       }
       m_writeQ.size -= n_pushed;
 
@@ -318,9 +318,9 @@ void Cache::ProcessWriteTasks()
 
       for (int bi = 0; bi < n_pushed; ++bi)
       {
-         Block* block = blks_to_write[bi];
+         BlockRun* run = runs_to_write[bi];
 
-         block->m_file->WriteBlockToDisk(block);
+         run->m_file->WriteRunToDisk(run);
       }
    }
 }

@@ -37,7 +37,10 @@ struct XrdOucIOVec;
 namespace XrdPfc
 {
 class File;
-class BlockResponseHandler;
+class Block;
+class BlockRun;
+class BlockRunResponseHandler;
+class BlockSequenceResponseHandler;
 class DirectResponseHandler;
 class IO;
 
@@ -103,43 +106,47 @@ using vChunkRequest_i = std::vector<ChunkRequest>::iterator;
 
 // ================================================================
 
+//------------------------------------------------------------------------------
+//! One cache block: the unit of cache *state* -- one bit in the cinfo block
+//! vector, one entry in File::m_block_map.
+//!
+//! A Block does not own its memory. It always belongs to a BlockRun, which owns
+//! the RAM allocation shared by all blocks of the run, and which is the unit of
+//! *transfer*: one remote request and one disk write per run. Everything about a
+//! block that describes the request it arrived on therefore lives on the run.
+//------------------------------------------------------------------------------
+
 class Block
 {
 public:
-   File               *m_file;
-   IO                 *m_io;            // IO that handled current request, used for == / != comparisons only
-   void               *m_req_id;        // Identity of requestor -- used for stats.
-
-   char               *m_buff;
+   BlockRun           *m_run;           // run owning the RAM buffer; never null
+   char               *m_buff;          // points into m_run->m_buff
    long long           m_offset;
    int                 m_size;
-   int                 m_req_size;
    int                 m_refcnt;
    int                 m_errno;         // stores negative errno
    bool                m_downloaded;
-   bool                m_prefetch;
-   bool                m_req_cksum_net;
-   vCkSum_t            m_cksum_vec;
-   int                 m_n_cksum_errors;
+   bool                m_prefetch;      // per block: a demand run can carry
+                                        // gap-filler blocks nobody asked for
 
    vChunkRequest_t     m_chunk_reqs;
 
-   Block(File *f, IO *io, void *rid, char *buf, long long off, int size, int rsize,
-         bool m_prefetch, bool cks_net) :
-      m_file(f), m_io(io), m_req_id(rid),
-      m_buff(buf), m_offset(off), m_size(size), m_req_size(rsize),
-      m_refcnt(0), m_errno(0), m_downloaded(false), m_prefetch(m_prefetch),
-      m_req_cksum_net(cks_net), m_n_cksum_errors(0)
+   Block(BlockRun *run, char *buf, long long off, int size, bool prefetch) :
+      m_run(run), m_buff(buf), m_offset(off), m_size(size),
+      m_refcnt(0), m_errno(0), m_downloaded(false), m_prefetch(prefetch)
    {}
 
-   char*     get_buff()     const { return m_buff;     }
-   int       get_size()     const { return m_size;     }
-   int       get_req_size() const { return m_req_size; }
-   long long get_offset()   const { return m_offset;   }
+   char*     get_buff()     const { return m_buff;   }
+   int       get_size()     const { return m_size;   }
+   long long get_offset()   const { return m_offset; }
 
-   File* get_file()   const { return m_file;   }
-   IO*   get_io()     const { return m_io;     }
-   void* get_req_id() const { return m_req_id; }
+   BlockRun* get_run()      const { return m_run;    }
+
+   // These delegate to the run -- see BlockRun for the definitions.
+   File* get_file()   const;
+   IO*   get_io()     const;
+   void* get_req_id() const;
+   bool  req_cksum_net() const;
 
    bool is_finished() const { return m_downloaded || m_errno != 0; }
    bool is_ok()       const { return m_downloaded; }
@@ -149,9 +156,78 @@ public:
    void set_error(int err)  { m_errno      = err;  }
    int  get_error() const   { return m_errno;      }
 
+   void reset_error()       { m_errno      = 0;    }
+};
+
+using BlockList_t = std::list<Block*>;
+using BlockList_i = std::list<Block*>::iterator;
+
+// ================================================================
+
+//------------------------------------------------------------------------------
+//! A run of index-consecutive blocks sharing one RAM allocation, one remote
+//! request and one disk write. This is the unit of transfer.
+//!
+//! When the cache block size is at or above the target IO size every run holds a
+//! single block and the behaviour is exactly that of the pre-BlockRun code. Small
+//! block sizes produce longer runs, which is the point: the block stays the unit
+//! of cache state while the transfer size stays sane.
+//!
+//! Lifetime: the RAM buffer is released and the run deleted when the last of its
+//! blocks is freed (m_n_live drops to zero), so a run outlives its response
+//! handler for as long as any of its blocks is still queued for writing. Code
+//! that iterates a run's blocks while completing them must snapshot m_blocks
+//! first -- completing the last block destroys the run.
+//------------------------------------------------------------------------------
+
+class BlockRun
+{
+public:
+   File               *m_file;
+   IO                 *m_io;            // IO that handled current request, used for == / != comparisons only
+   void               *m_req_id;        // Identity of requestor -- used for stats.
+
+   char               *m_buff;          // one Cache::RequestRAM(m_alloc_size)
+   long long           m_offset;        // file offset of the first block
+   int                 m_alloc_size;    // RAM allocated; also the length passed to
+                                        // pgRead, which wants whole 4k pages
+   int                 m_data_size;     // bytes of file data the run covers; the
+                                        // length passed to Read and the expected
+                                        // response size. <= m_alloc_size.
+   int                 m_first_idx;     // index of the first block
+   int                 m_n_live;        // blocks still referencing m_buff
+
+   bool                m_prefetch_run;  // issued by the prefetch thread; drives
+                                        // IO::m_active_prefetches accounting.
+                                        // Distinct from Block::m_prefetch, which
+                                        // says nobody asked for that block's data.
+   bool                m_req_cksum_net;
+   vCkSum_t            m_cksum_vec;
+   int                 m_n_cksum_errors;
+
+   std::vector<Block*> m_blocks;
+
+   BlockRun(File *f, IO *io, void *rid, char *buf, long long off,
+            int alloc_size, int data_size, int first_idx, bool prefetch, bool cks_net) :
+      m_file(f), m_io(io), m_req_id(rid),
+      m_buff(buf), m_offset(off), m_alloc_size(alloc_size), m_data_size(data_size),
+      m_first_idx(first_idx), m_n_live(0),
+      m_prefetch_run(prefetch), m_req_cksum_net(cks_net), m_n_cksum_errors(0)
+   {}
+
+   char*     get_buff()       const { return m_buff;      }
+   long long get_offset()     const { return m_offset;    }
+   int       get_alloc_size() const { return m_alloc_size; }
+   int       get_data_size()  const { return m_data_size;  }
+   int       get_n_blocks()   const { return (int) m_blocks.size(); }
+
+   File* get_file()   const { return m_file;   }
+   IO*   get_io()     const { return m_io;     }
+   void* get_req_id() const { return m_req_id; }
+
    void reset_error_and_set_io(IO *io, void *rid)
    {
-      m_errno  = 0;
+      for (Block *b : m_blocks) b->reset_error();
       m_io     = io;
       m_req_id = rid;
    }
@@ -163,17 +239,46 @@ public:
    int*      ptr_n_cksum_errors()  { return &m_n_cksum_errors; }
 };
 
-using BlockList_t = std::list<Block*>;
-using BlockList_i = std::list<Block*>::iterator;
+using BlockRunList_t = std::vector<BlockRun*>;
+
+inline File* Block::get_file()       const { return m_run->m_file;          }
+inline IO*   Block::get_io()         const { return m_run->m_io;            }
+inline void* Block::get_req_id()     const { return m_run->m_req_id;        }
+inline bool  Block::req_cksum_net()  const { return m_run->m_req_cksum_net; }
 
 // ================================================================
 
-class BlockResponseHandler : public XrdOucCacheIOCB
+//------------------------------------------------------------------------------
+//! Completion of one remote request covering a single run.
+//------------------------------------------------------------------------------
+
+class BlockRunResponseHandler : public XrdOucCacheIOCB
 {
 public:
-   Block *m_block;
+   BlockRun *m_run;
 
-   BlockResponseHandler(Block *b) : m_block(b) {}
+   BlockRunResponseHandler(BlockRun *r) : m_run(r) {}
+
+   void Done(int result) override;
+};
+
+// ----------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+//! Completion of one remote ReadV covering several runs. The origin gives us a
+//! single result for the whole vector, so all runs succeed or fail together.
+//------------------------------------------------------------------------------
+
+class BlockSequenceResponseHandler : public XrdOucCacheIOCB
+{
+public:
+   File           *m_file;
+   BlockRunList_t  m_runs;
+   int             m_expected_size;
+
+   BlockSequenceResponseHandler(File *f, BlockRunList_t runs, int expected_size) :
+      m_file(f), m_runs(std::move(runs)), m_expected_size(expected_size)
+   {}
 
    void Done(int result) override;
 };
@@ -202,7 +307,8 @@ public:
 class File
 {
    friend class Cache;
-   friend class BlockResponseHandler;
+   friend class BlockRunResponseHandler;
+   friend class BlockSequenceResponseHandler;
    friend class DirectResponseHandler;
 public:
    // Constructor, destructor, Open() and Close() are private.
@@ -210,11 +316,11 @@ public:
    //! Static constructor that also does Open. Returns null ptr if Open fails.
    static File* FileOpen(const std::string &path, long long offset, long long fileSize, XrdOucCacheIO *inputIO);
 
-   //! Handle removal of a block from Cache's write queue.
-   void BlockRemovedFromWriteQ(Block*);
+   //! Handle removal of a block run from Cache's write queue.
+   void RunRemovedFromWriteQ(BlockRun*);
 
-   //! Handle removal of a set of blocks from Cache's write queue.
-   void BlocksRemovedFromWriteQ(std::list<Block*>&);
+   //! Handle removal of a set of block runs from Cache's write queue.
+   void RunsRemovedFromWriteQ(std::list<BlockRun*>&);
 
    //! Normal read.
    int Read(IO *io, char* buff, long long offset, int size, ReadReqRH *rh);
@@ -250,7 +356,7 @@ public:
    //----------------------------------------------------------------------
    void Sync();
 
-   void WriteBlockToDisk(Block *b);
+   void WriteRunToDisk(BlockRun *run);
 
    void Prefetch();
 
@@ -390,10 +496,12 @@ private:
 
    // Read & ReadV
 
-   Block* PrepareBlockRequest(int i, IO *io, void *req_id, bool prefetch);
+   //! Allocate a run of n_blocks consecutive blocks starting at first_idx.
+   //! Returns null if RAM is not available. Must be called under m_state_cond.
+   BlockRun* PrepareBlockRun(int first_idx, int n_blocks, IO *io, void *req_id, bool prefetch);
 
-   void   ProcessBlockRequest (Block       *b);
-   void   ProcessBlockRequests(BlockList_t& blks);
+   void   ProcessRunRequest (BlockRun       *run);
+   void   ProcessRunRequests(BlockRunList_t& runs, IO *io);
 
    void   RequestBlocksDirect(IO *io, ReadRequest *read_req, std::vector<XrdOucIOVec>& ioVec, int expected_size);
 
@@ -407,13 +515,18 @@ private:
    void ProcessBlockSuccess(Block *b, ChunkRequest &creq);
    void FinalizeReadRequest(ReadRequest *rreq);
 
-   void ProcessBlockResponse(Block *b, int res);
+   void ProcessRunResponse(BlockRun *run, int res);
+   void ProcessSequenceResponse(BlockSequenceResponseHandler *h, int res);
 
    // Block management
 
    void inc_ref_count(Block* b);
    void dec_ref_count(Block* b, int count = 1);
    void free_block(Block*);
+
+   //! Release the reference PrepareBlockRun took on each block on the run's own
+   //! behalf. Always called under lock; may free blocks and delete the run.
+   void release_run_ref(BlockRun *run);
 
    bool select_current_io_or_disable_prefetching(bool skip_current);
 
