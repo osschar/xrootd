@@ -65,7 +65,8 @@ File::File(const std::string& path, long long iOffset, long long iFileSize) :
    m_file_size(iFileSize),
    m_current_io(m_io_set.end()),
    m_ios_in_detach(0),
-   m_non_flushed_cnt(0),
+   m_bytes_during_sync(0),
+   m_non_flushed_bytes(0),
    m_in_sync(false),
    m_detach_time_logged(false),
    m_in_shutdown(false),
@@ -332,7 +333,7 @@ bool File::FinalizeSyncBeforeExit()
    XrdSysCondVarHelper _lck(m_state_cond);
    if ( ! m_in_shutdown)
    {
-     if ( ! m_writes_during_sync.empty() || m_non_flushed_cnt > 0 || ! m_detach_time_logged)
+     if ( ! m_writes_during_sync.empty() || m_non_flushed_bytes > 0 || ! m_detach_time_logged)
      {
        report_and_merge_delta_stats();
        m_cfi.WriteIOStatDetach(m_stats);
@@ -1217,17 +1218,18 @@ void File::WriteBlockToDisk(Block* b)
       if (m_in_sync)
       {
          m_writes_during_sync.push_back(blk_idx);
+         m_bytes_during_sync += size;
       }
       else
       {
          m_cfi.SetBitSynced(blk_idx);
-         ++m_non_flushed_cnt;
-         if ((m_cfi.IsComplete() || m_non_flushed_cnt >= Cache::GetInstance().RefConfiguration().m_flushCnt) &&
+         m_non_flushed_bytes += size;
+         if ((m_cfi.IsComplete() || m_non_flushed_bytes >= Cache::GetInstance().RefConfiguration().m_flushBytes) &&
              ! m_in_shutdown)
          {
             schedule_sync     = true;
             m_in_sync         = true;
-            m_non_flushed_cnt = 0;
+            m_non_flushed_bytes = 0;
          }
       }
       // As soon as the reference count is decreased on the block, the
@@ -1300,8 +1302,10 @@ void File::Sync()
       {
          m_cfi.SetBitSynced(*i);
       }
-      written_while_in_sync = m_non_flushed_cnt = (int) m_writes_during_sync.size();
+      written_while_in_sync = (int) m_writes_during_sync.size();
+      m_non_flushed_bytes   = m_bytes_during_sync;
       m_writes_during_sync.clear();
+      m_bytes_during_sync = 0;
 
       // If there were writes during sync and the file is now complete,
       // let us call Sync again without resetting the m_in_sync flag.

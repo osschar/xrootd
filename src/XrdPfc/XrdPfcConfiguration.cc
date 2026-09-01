@@ -56,7 +56,7 @@ Configuration::Configuration() :
    m_wqueue_threads(4),
    m_prefetch_max_blocks(10),
    m_hdfsbsize(128*1024*1024),
-   m_flushCnt(2000),
+   m_flushBytes(256 * 1024 * 1024),
    m_cs_UVKeep(-1),
    m_cs_Chk(CSChk_Net),
    m_cs_ChkTLS(false),
@@ -663,26 +663,30 @@ bool Cache::Config(const char *config_filename, const char *parameters, XrdOucEn
       }
    }
 
-   // sets flush frequency
+   // Sets flush frequency. It is kept in bytes internally so that it does not
+   // depend on the block size, which can be set per file through URL CGI.
+   // A bare number is still accepted as a number of blocks, for backward
+   // compatibility, and is converted to bytes using the configured block size.
    if ( ! tmpc.m_flushRaw.empty())
    {
       if (::isalpha(*(tmpc.m_flushRaw.rbegin())))
       {
          if (XrdOuca2x::a2sz(m_log, "Error getting number of bytes written before flush",  tmpc.m_flushRaw.c_str(),
-                             &m_configuration.m_flushCnt,
+                             &m_configuration.m_flushBytes,
                              100 * m_configuration.m_bufferSize , 100000 * m_configuration.m_bufferSize))
          {
             return false;
          }
-         m_configuration.m_flushCnt /= m_configuration.m_bufferSize;
       }
       else
       {
+         long long n_blocks;
          if (XrdOuca2x::a2ll(m_log, "Error getting number of blocks written before flush", tmpc.m_flushRaw.c_str(),
-                             &m_configuration.m_flushCnt, 100, 100000))
+                             &n_blocks, 100, 100000))
          {
             return false;
          }
+         m_configuration.m_flushBytes = n_blocks * m_configuration.m_bufferSize;
       }
    }
 
@@ -739,7 +743,7 @@ bool Cache::Config(const char *config_filename, const char *parameters, XrdOucEn
                  "       pfc.diskusage %lld %lld files %lld %lld %lld purgeinterval %d purgecoldfiles %d\n"
                  "       pfc.spaces %s %s\n"
                  "       pfc.trace %d\n"
-                 "       pfc.flush %lld\n"
+                 "       pfc.flush %lldk\n"
                  "       pfc.acchistorysize %d\n"
                  "       pfc.onlyIfCachedMinBytes %lld\n"
                  "       pfc.onlyIfCachedMinFrac %.2f\n",
@@ -757,7 +761,7 @@ bool Cache::Config(const char *config_filename, const char *parameters, XrdOucEn
                  m_configuration.m_data_space.c_str(),
                  m_configuration.m_meta_space.c_str(),
                  m_trace->What,
-                 m_configuration.m_flushCnt,
+                 m_configuration.m_flushBytes >> 10,
                  m_configuration.m_accHistorySize,
                  m_configuration.m_onlyIfCachedMinSize,
                  m_configuration.m_onlyIfCachedMinFrac);

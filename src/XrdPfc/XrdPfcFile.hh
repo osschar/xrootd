@@ -328,7 +328,8 @@ private:
    // FSync
 
    std::vector<int>  m_writes_during_sync;
-   int  m_non_flushed_cnt;
+   long long m_bytes_during_sync;   //!< bytes written while a sync was in progress
+   long long m_non_flushed_bytes;   //!< bytes written to disk since the last sync
    bool m_in_sync;
    bool m_detach_time_logged;
    bool m_in_shutdown;        //!< file is in emergency shutdown due to irrecoverable error or unlink request

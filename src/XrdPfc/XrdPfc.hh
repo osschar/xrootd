@@ -123,7 +123,7 @@ struct Configuration
    bool      m_cgi_prefetch_allowed  = false;   //!< allow cgi setting of prefetch
 
    long long m_hdfsbsize;               //!< used with m_hdfsmode, default 128MB
-   long long m_flushCnt;                //!< nuber of unsynced blcoks on disk before flush is called
+   long long m_flushBytes;              //!< number of unsynced bytes on disk before flush is called
 
    time_t    m_cs_UVKeep;               //!< unverified checksum cache keep
    int       m_cs_Chk;                  //!< Checksum check
