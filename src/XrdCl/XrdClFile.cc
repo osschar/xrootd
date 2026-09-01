@@ -340,6 +340,46 @@ namespace XrdCl
   }
 
   //----------------------------------------------------------------------------
+  // Read scattered data chunks, with a crc32c per 4KB page - async
+  //----------------------------------------------------------------------------
+  XRootDStatus File::PgReadV( const ChunkList &chunks,
+                              ResponseHandler *handler,
+                              time_t           timeout )
+  {
+    if( pPlugIn )
+      return pPlugIn->PgReadV( chunks, handler, timeout );
+
+    return FileStateHandler::PgReadV( pImpl->pStateHandler, chunks, handler, timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  // Read scattered data chunks, with a crc32c per 4KB page - sync
+  //----------------------------------------------------------------------------
+  XRootDStatus File::PgReadV( const ChunkList                    &chunks,
+                              std::vector<std::vector<uint32_t>> &cksums,
+                              uint32_t                           &bytesRead,
+                              time_t                              timeout )
+  {
+    SyncResponseHandler handler;
+    XRootDStatus st = PgReadV( chunks, &handler, timeout );
+    if( !st.IsOK() )
+      return st;
+
+    VectorPgReadInfo *vPgReadInfo = 0;
+    XRootDStatus status = MessageUtils::WaitForResponse( &handler, vPgReadInfo );
+    if( status.IsOK() )
+    {
+      bytesRead = vPgReadInfo->GetSize();
+      cksums.clear();
+      cksums.reserve( vPgReadInfo->GetPages().size() );
+      for( auto &pg : vPgReadInfo->GetPages() )
+        cksums.emplace_back( pg.GetCksums() );
+      delete vPgReadInfo;
+    }
+    return status;
+  }
+
+  //----------------------------------------------------------------------------
   // Write a data chunk at a given offset - async
   //----------------------------------------------------------------------------
   XRootDStatus File::Write( uint64_t         offset,

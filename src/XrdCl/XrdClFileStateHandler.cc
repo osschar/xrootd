@@ -398,6 +398,173 @@ namespace
   };
 
   //----------------------------------------------------------------------------
+  // Assembles a PgReadV response out of one PgRead per requested extent.
+  //
+  // This is what is used whenever a single kXR_pgreadv cannot be sent, and it
+  // is what makes File::PgReadV available against every server, including ones
+  // that do not know the request at all -- there PgRead itself substitutes a
+  // plain Read, so the fallback is two levels deep and still correct.
+  //
+  // Lifetime: the object owns its per-extent handlers and deletes itself once
+  // all of them have reported. The count starts one too high, the extra one
+  // being released by IssueDone() when the issuing loop is over, so that an
+  // extent failing to issue cannot destroy the object under that loop's feet.
+  //----------------------------------------------------------------------------
+  class PgReadVHandler
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      // Constructor
+      //------------------------------------------------------------------------
+      PgReadVHandler( XrdCl::ResponseHandler *userHandler, size_t nbext ) :
+        userHandler( userHandler ),
+        vinfo( new XrdCl::VectorPgReadInfo() ),
+        st( new XrdCl::XRootDStatus() ),
+        pending( nbext + 1 )
+      {
+        vinfo->GetPages().resize( nbext );
+        elements.reserve( nbext );
+        for( size_t i = 0; i < nbext; ++i )
+          elements.emplace_back( new Element( this, i ) );
+      }
+
+      //------------------------------------------------------------------------
+      // The handler to be given to the PgRead of extent `index`
+      //------------------------------------------------------------------------
+      XrdCl::ResponseHandler* ElementHandler( size_t index )
+      {
+        return elements[index].get();
+      }
+
+      //------------------------------------------------------------------------
+      // Called once the issuing loop is done, may delete the object
+      //------------------------------------------------------------------------
+      void IssueDone()
+      {
+        Release();
+      }
+
+    private:
+
+      //------------------------------------------------------------------------
+      // Per-extent handler, knows which extent it is serving
+      //------------------------------------------------------------------------
+      class Element : public XrdCl::ResponseHandler
+      {
+        public:
+
+          Element( PgReadVHandler *parent, size_t index ) :
+            parent( parent ), index( index ) {}
+
+          void HandleResponseWithHosts( XrdCl::XRootDStatus *status,
+                                        XrdCl::AnyObject    *response,
+                                        XrdCl::HostList     *hostList )
+          {
+            parent->Complete( index, status, response, hostList );
+          }
+
+        private:
+
+          PgReadVHandler *parent;
+          size_t          index;
+      };
+
+      //------------------------------------------------------------------------
+      // Absorb the response for one extent
+      //------------------------------------------------------------------------
+      void Complete( size_t                index,
+                     XrdCl::XRootDStatus  *status,
+                     XrdCl::AnyObject     *response,
+                     XrdCl::HostList      *hostList )
+      {
+        using namespace XrdCl;
+
+        {
+          std::lock_guard<std::mutex> lck( mtx );
+
+          if( hostList && !hosts ) hosts.reset( hostList );
+          else delete hostList;
+
+          if( status->IsOK() )
+          {
+            PageInfo *pginf = 0;
+            if( response ) response->Get( pginf );
+            if( pginf )
+              //----------------------------------------------------------------
+              // Move assignment swaps the implementations, so the PageInfo left
+              // in the response stays valid for its own destructor.
+              //----------------------------------------------------------------
+              vinfo->GetPages()[index] = std::move( *pginf );
+            else if( st->IsOK() )
+              st.reset( new XRootDStatus( stError, errInternal, 0,
+                                          "PgRead returned no page info." ) );
+            delete status;
+          }
+          else
+          {
+            //------------------------------------------------------------------
+            // Keep the first error, discard the rest
+            //------------------------------------------------------------------
+            if( st->IsOK() ) st.reset( status );
+            else             delete status;
+          }
+
+          delete response;
+        }
+
+        Release();
+      }
+
+      //------------------------------------------------------------------------
+      // Drop one reference, finalize on the last
+      //------------------------------------------------------------------------
+      void Release()
+      {
+        size_t left;
+        {
+          std::lock_guard<std::mutex> lck( mtx );
+          left = --pending;
+        }
+        if( left == 0 ) Finalize();
+      }
+
+      //------------------------------------------------------------------------
+      // Report to the user and commit suicide
+      //------------------------------------------------------------------------
+      void Finalize()
+      {
+        using namespace XrdCl;
+
+        if( st->IsOK() )
+        {
+          uint32_t total = 0;
+          for( auto &pg : vinfo->GetPages() ) total += pg.GetLength();
+          vinfo->SetSize( total );
+
+          AnyObject *response = new AnyObject();
+          response->Set( vinfo.release() );
+          userHandler->HandleResponseWithHosts( st.release(), response,
+                                                hosts.release() );
+        }
+        else
+          userHandler->HandleResponseWithHosts( st.release(), 0, hosts.release() );
+
+        delete this;
+      }
+
+      XrdCl::ResponseHandler                     *userHandler;
+      std::vector<std::unique_ptr<Element>>       elements;
+
+      std::unique_ptr<XrdCl::VectorPgReadInfo>    vinfo;
+      std::unique_ptr<XrdCl::XRootDStatus>        st;
+      std::unique_ptr<XrdCl::HostList>            hosts;
+
+      std::mutex mtx;
+      size_t     pending;
+  };
+
+  //----------------------------------------------------------------------------
   // Object that does things to the FileStateHandler when kXR_open returns
   // and then calls the user handler
   //----------------------------------------------------------------------------
@@ -1290,6 +1457,84 @@ namespace XrdCl
     StatefulHandler *stHandler = new StatefulHandler( self, handler, msg, params );
 
     return SendOrQueue( self, *self->pDataServer, msg, stHandler, params );
+  }
+
+  //----------------------------------------------------------------------------
+  // Read scattered data chunks, with a crc32c per 4KB page
+  //----------------------------------------------------------------------------
+  XRootDStatus FileStateHandler::PgReadV( std::shared_ptr<FileStateHandler> &self,
+                                          const ChunkList                   &chunks,
+                                          ResponseHandler                   *handler,
+                                          time_t                             timeout )
+  {
+    if( chunks.empty() )
+      return XRootDStatus( stError, errInvalidArgs, EINVAL,
+                           "PgReadV requires at least one chunk." );
+
+    return PgReadVImpl( self, chunks, PgReadFlags::None, handler, timeout );
+  }
+
+  //----------------------------------------------------------------------------
+  // Read scattered data chunks, with a crc32c per 4KB page (actual
+  // implementation)
+  //
+  // For now this is a loop over PgRead. The API and the response shape are the
+  // ones a single kXR_pgreadv will produce, so callers are already written
+  // against the final interface; and the loop remains as the fallback for
+  // servers that do not know the request.
+  //----------------------------------------------------------------------------
+  XRootDStatus FileStateHandler::PgReadVImpl( std::shared_ptr<FileStateHandler> &self,
+                                              const ChunkList                   &chunks,
+                                              uint16_t                           flags,
+                                              ResponseHandler                   *handler,
+                                              time_t                             timeout )
+  {
+    //--------------------------------------------------------------------------
+    // Sanity check. PgRead re-checks under the lock, this is only so an
+    // unusable file reports before any handler has been created.
+    //--------------------------------------------------------------------------
+    {
+      XrdSysMutexHelper scopedLock( self->pMutex );
+
+      if( self->pFileState == Error ) return self->pStatus;
+
+      if( self->pFileState != Opened && self->pFileState != Recovering )
+        return XRootDStatus( stError, errInvalidOp );
+
+      Log *log = DefaultEnv::GetLog();
+      log->Debug( FileMsg, "[%p@%s] Sending %zu pgread commands for handle %#x to %s",
+                  (void*)self.get(), self->pFileUrl->GetObfuscatedURL().c_str(),
+                  chunks.size(), *((uint32_t*)self->pFileHandle),
+                  self->pDataServer->GetHostId().c_str() );
+    }
+
+    //--------------------------------------------------------------------------
+    // Retry is a single-page affair, it never reaches the vector entry point
+    //--------------------------------------------------------------------------
+    if( flags & PgReadFlags::Retry )
+      return XRootDStatus( stError, errInvalidArgs, EINVAL,
+                           "PgReadV does not support the retry flag." );
+
+    //--------------------------------------------------------------------------
+    // From here on the handler is ours: every extent reports through the
+    // aggregate, including the ones that fail to be issued, so this must
+    // return OK even then -- an error return would tell the caller that the
+    // handler was never engaged.
+    //--------------------------------------------------------------------------
+    PgReadVHandler *pgvHandler = new PgReadVHandler( handler, chunks.size() );
+
+    for( size_t i = 0; i < chunks.size(); ++i )
+    {
+      ResponseHandler *element = pgvHandler->ElementHandler( i );
+      XRootDStatus st = PgRead( self, chunks[i].offset, chunks[i].length,
+                                chunks[i].buffer, element, timeout );
+      if( !st.IsOK() )
+        element->HandleResponseWithHosts( new XRootDStatus( st ), 0, 0 );
+    }
+
+    pgvHandler->IssueDone();
+
+    return XRootDStatus();
   }
 
   //----------------------------------------------------------------------------

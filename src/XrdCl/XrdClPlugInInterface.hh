@@ -131,6 +131,17 @@ namespace XrdCl
       }
 
       //------------------------------------------------------------------------
+      //! @see XrdCl::File::PgReadV
+      //------------------------------------------------------------------------
+      virtual XRootDStatus PgReadV( const ChunkList &chunks,
+                                    ResponseHandler *handler,
+                                    time_t           timeout )
+      {
+        (void)chunks; (void)handler; (void)timeout;
+        return XRootDStatus( stError, errNotImplemented );
+      }
+
+      //------------------------------------------------------------------------
       //! @see XrdCl::File::Write
       //------------------------------------------------------------------------
       virtual XRootDStatus Write( uint64_t         offset,
