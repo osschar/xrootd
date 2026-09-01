@@ -50,7 +50,7 @@ Configuration::Configuration() :
    m_dirStatsInterval(900),
    m_dirStatsStoreDepth(1),
    m_bufferSize(128*1024),
-   m_iosize(64*1024),
+   m_iosize(1024*1024),
    m_iogap(0),
    m_RamAbsAvailable(0),
    m_RamKeepStdBlocks(0),
@@ -1062,10 +1062,15 @@ bool Cache::ConfigParameters(std::string part, XrdOucStream& config, TmpConfigur
    }
    else if ( part == "iosize" )
    {
-      // Target size of a single remote request and disk write. Consecutive
-      // blocks are grouped into a BlockRun up to this size, so that a small
+      // Maximum size of one BlockRun: one remote request and one disk write.
+      // Consecutive blocks are grouped up to this size, so that a small
       // pfc.blocksize keeps cinfo granularity fine without making every
       // transfer tiny.
+      //
+      // A run only ever spans blocks that are actually needed, so raising this
+      // fetches no extra data -- it only stops long contiguous extents being
+      // chopped into several adjacent elements of the same vector read. Its
+      // real purpose is to bound a single RAM allocation.
       if ( ! blocksize_str2value("Config", cwg.GetWord(), CFG.m_iosize,
                                  CFG.s_min_iosize, CFG.s_max_iosize))
          return false;
