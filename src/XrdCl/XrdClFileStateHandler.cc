@@ -1725,6 +1725,31 @@ namespace XrdCl
                            "PgReadV requires at least one chunk." );
 
     //--------------------------------------------------------------------------
+    // Fall back to a pgRead per extent if the server cannot do this in one
+    // request, or if there are more extents than one request can carry. Both
+    // give the caller the same answer, only in more round trips.
+    //--------------------------------------------------------------------------
+    if( !PgReadVSupported( self ) )
+    {
+      DefaultEnv::GetLog()->Debug( FileMsg, "[%p@%s] PgReadV not supported; "
+                                   "substituting with a pgRead per extent.",
+                                   (void*)self.get(),
+                                   self->pFileUrl->GetObfuscatedURL().c_str() );
+      return PgReadVSubst( self, chunks, handler, timeout );
+    }
+
+    if( chunks.size() > size_t( XrdProto::maxRvecsz ) )
+    {
+      DefaultEnv::GetLog()->Debug( FileMsg, "[%p@%s] PgReadV of %zu extents "
+                                   "exceeds the %d the request can carry; "
+                                   "substituting with a pgRead per extent.",
+                                   (void*)self.get(),
+                                   self->pFileUrl->GetObfuscatedURL().c_str(),
+                                   chunks.size(), XrdProto::maxRvecsz );
+      return PgReadVSubst( self, chunks, handler, timeout );
+    }
+
+    //--------------------------------------------------------------------------
     // The wire path needs the checksums verified here; the fallback does not,
     // since each of its PgReads is verified by its own PgReadHandler.
     //--------------------------------------------------------------------------
@@ -1732,6 +1757,28 @@ namespace XrdCl
     auto st = PgReadVImpl( self, chunks, PgReadFlags::None, pgvHandler, timeout );
     if( !st.IsOK() ) delete pgvHandler;
     return st;
+  }
+
+  //----------------------------------------------------------------------------
+  // Can the data server do a vector pgRead in one request?
+  //----------------------------------------------------------------------------
+  bool FileStateHandler::PgReadVSupported( std::shared_ptr<FileStateHandler> &self )
+  {
+    AnyObject obj;
+    XRootDStatus st1 = DefaultEnv::GetPostMaster()->QueryTransport(
+                          *self->pDataServer, XRootDQuery::ServerFlags, obj );
+    int protver = 0;
+    XRootDStatus st2 = Utils::GetProtocolVersion( *self->pDataServer, protver );
+
+    if( !st1.IsOK() || !st2.IsOK() ) return false;
+
+    int *ptr = 0;
+    obj.Get( ptr );
+    bool ok = ( ptr && ( *ptr & kXR_suppgrw ) ) &&
+              ( protver >= kXR_PROTPGRVVERSION );
+    delete ptr;
+
+    return ok;
   }
 
   //----------------------------------------------------------------------------

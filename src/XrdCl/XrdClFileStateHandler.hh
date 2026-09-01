@@ -364,6 +364,13 @@ namespace XrdCl
                                         time_t                             timeout = 0 );
 
       //------------------------------------------------------------------------
+      //! @return : true if the data server can do a vector pgRead in one
+      //!           request, false if it has to be substituted with a pgRead
+      //!           per extent
+      //------------------------------------------------------------------------
+      static bool PgReadVSupported( std::shared_ptr<FileStateHandler> &self );
+
+      //------------------------------------------------------------------------
       //! Write a data chunk at a given offset - async
       //!
       //! @param offset  offset from the beginning of the file
