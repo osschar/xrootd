@@ -849,22 +849,21 @@ void File::ProcessRunRequests(BlockRunList_t& runs, IO *io)
    // This *must not* be called with block_map locked.
    //
    // A single run goes out as a plain Read / pgRead. Several runs are batched
-   // into one remote ReadV -- unless network checksums are requested, in which
-   // case pgRead is mandatory and has no vector form, so we fall back to one
-   // pgRead per run.
+   // into one remote ReadV, or pgReadV when network checksums are requested.
 
    if (runs.empty()) return;
 
-   if (runs.size() == 1 || cache()->RefConfiguration().is_cschk_net())
+   if (runs.size() == 1)
    {
-      for (BlockRun *run : runs)
-         ProcessRunRequest(run);
+      ProcessRunRequest(runs.front());
       return;
    }
 
-   // One ReadV per XrdProto::maxRvecsz runs. Individual runs are capped well
-   // below XrdProto::maxRVdsz by the target IO size, so only the element count
-   // can force a split.
+   const bool cks_net = cache()->RefConfiguration().is_cschk_net();
+
+   // One vector request per XrdProto::maxRvecsz runs. Individual runs are
+   // capped well below XrdProto::maxRVdsz by the target IO size, so only the
+   // element count can force a split.
    int n_runs = (int) runs.size();
    int pos    = 0;
 
@@ -881,17 +880,26 @@ void File::ProcessRunRequests(BlockRunList_t& runs, IO *io)
       for (int k = 0; k < n; ++k)
       {
          BlockRun *run = runs[pos + k];
+         // Note this is data_size, not the alloc_size a single-run pgRead asks
+         // for: a vector request is all or nothing, and the last run of a file
+         // would otherwise come up short of its page-rounded length and fail
+         // the whole batch. The checksum vector then covers exactly the data,
+         // which is what WriteRunToDisk() hands to pgWrite anyway.
          iov.push_back( { run->get_offset(), run->get_data_size(), 0, run->get_buff() } );
          batch.push_back(run);
          expected += run->get_data_size();
       }
 
-      TRACEF(Dump, "ProcessRunRequests() issuing ReadV for n_runs = " << n <<
-             ", total_size = " << expected);
+      TRACEF(Dump, "ProcessRunRequests() issuing " << (cks_net ? "pgReadV" : "ReadV") <<
+             " for n_runs = " << n << ", total_size = " << expected);
 
-      auto *bsh = new BlockSequenceResponseHandler(this, std::move(batch), expected);
+      auto *bsh = new BlockSequenceResponseHandler(this, std::move(batch), expected, cks_net);
 
-      io->GetInput()->ReadV(*bsh, iov.data(), n);
+      if (cks_net)
+         io->GetInput()->pgReadV(*bsh, iov.data(), n, bsh->ptr_cksum_vecs(), 0,
+                                 bsh->ptr_n_cksum_errors());
+      else
+         io->GetInput()->ReadV(*bsh, iov.data(), n);
 
       pos += n;
    }
@@ -1918,8 +1926,25 @@ void File::ProcessRunResponse(BlockRun *run, int res)
 
 void File::ProcessSequenceResponse(BlockSequenceResponseHandler *h, int res)
 {
-   // A batched ReadV yields a single result for all of its runs, so they
-   // succeed or fail together.
+   // A batched ReadV or pgReadV yields a single result for all of its runs, so
+   // they succeed or fail together.
+
+   if (res == h->m_expected_size && h->req_cksum_net())
+   {
+      // Hand each run its checksums. This must happen before any run is
+      // completed below, since completing it lets the write thread reach
+      // WriteRunToDisk(), which asks the run for them.
+      for (int k = 0; k < (int) h->m_runs.size(); ++k)
+         h->m_runs[k]->ref_cksum_vec() = std::move(h->m_cksum_vecs[k]);
+
+      // pgReadV reports corrected checksum errors for the vector as a whole.
+      // Per-run attribution is not available and not needed: the value is
+      // aggregated into the file's write stats the moment each run is written
+      // and is never reported per run, so booking the batch total against the
+      // first run keeps every number a reader ever sees correct.
+      if (h->m_n_cksum_errors)
+         *h->m_runs.front()->ptr_n_cksum_errors() = h->m_n_cksum_errors;
+   }
 
    if (res == h->m_expected_size)
    {
@@ -1930,7 +1955,7 @@ void File::ProcessSequenceResponse(BlockSequenceResponseHandler *h, int res)
 
    if (res >= 0)
    {
-      TRACEF(Error, "ProcessSequenceResponse() short ReadV over " << (int) h->m_runs.size() <<
+      TRACEF(Error, "ProcessSequenceResponse() short vector read over " << (int) h->m_runs.size() <<
              " runs, got " << res << " expected " << h->m_expected_size <<
              ", assuming remote/local file size mismatch, unlinking local files and initiating shutdown of File object");
       Cache::GetInstance().UnlinkFile(m_filename, false);

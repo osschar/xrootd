@@ -265,8 +265,14 @@ public:
 // ----------------------------------------------------------------
 
 //------------------------------------------------------------------------------
-//! Completion of one remote ReadV covering several runs. The origin gives us a
-//! single result for the whole vector, so all runs succeed or fail together.
+//! Completion of one remote ReadV or pgReadV covering several runs. The origin
+//! gives us a single result for the whole vector, so all runs succeed or fail
+//! together.
+//!
+//! For the pgReadV case the handler also owns the checksum vectors, because
+//! XrdOucCacheIO::pgReadV wants them as one contiguous array and the runs' own
+//! vectors are separate objects. They are moved into the runs on completion,
+//! before any of them can reach the disk.
 //------------------------------------------------------------------------------
 
 class BlockSequenceResponseHandler : public XrdOucCacheIOCB
@@ -276,9 +282,19 @@ public:
    BlockRunList_t  m_runs;
    int             m_expected_size;
 
-   BlockSequenceResponseHandler(File *f, BlockRunList_t runs, int expected_size) :
+   std::vector<vCkSum_t> m_cksum_vecs;      // non-empty only for pgReadV
+   int                   m_n_cksum_errors = 0;
+
+   BlockSequenceResponseHandler(File *f, BlockRunList_t runs, int expected_size,
+                                bool with_cksums = false) :
       m_file(f), m_runs(std::move(runs)), m_expected_size(expected_size)
-   {}
+   {
+      if (with_cksums) m_cksum_vecs.resize(m_runs.size());
+   }
+
+   bool       req_cksum_net()      const { return ! m_cksum_vecs.empty(); }
+   vCkSum_t*  ptr_cksum_vecs()           { return m_cksum_vecs.data(); }
+   int*       ptr_n_cksum_errors()       { return &m_n_cksum_errors; }
 
    void Done(int result) override;
 };
