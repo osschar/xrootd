@@ -45,10 +45,12 @@
 
 namespace
 {
+  class PgRetryTarget;
   class PgReadHandler;
   class PgReadRetryHandler;
   class PgReadSubstitutionHandler;
   class PgReadVHandler;
+  class PgReadVSubstHandler;
   class OpenHandler;
 }
 
@@ -99,6 +101,7 @@ namespace XrdCl
       friend class ::PgReadRetryHandler;
       friend class ::PgReadSubstitutionHandler;
       friend class ::PgReadVHandler;
+      friend class ::PgReadVSubstHandler;
       friend class ::OpenHandler;
 
     public:
@@ -279,7 +282,7 @@ namespace XrdCl
                                        uint32_t                           size,
                                        size_t                             pgnb,
                                        void                              *buffer,
-                                       PgReadHandler                     *handler,
+                                       PgRetryTarget                     *handler,
                                        time_t                             timeout = 0 );
 
       //------------------------------------------------------------------------
