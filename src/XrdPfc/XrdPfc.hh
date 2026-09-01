@@ -111,7 +111,7 @@ struct Configuration
    int       m_dirStatsStoreDepth;      //!< maximum depth for statistics write out
 
    long long m_bufferSize;              //!< cache block size, default 128 kB
-   long long m_iosize;                  //!< target size of a remote request / disk write, default 64 kB
+   long long m_iosize;                  //!< max size of one BlockRun: one remote request, one disk write. Default 1 MB.
    long long m_iogap;                   //!< bridge gaps up to this size when grouping blocks into a run, default 0 (off)
    long long m_RamAbsAvailable;         //!< available from configuration
    int       m_RamKeepStdBlocks;        //!< number of standard-sized blocks kept after release
