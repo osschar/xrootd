@@ -50,7 +50,7 @@ class XrdPosixFileRH : public XrdJob,
 public:
 
 enum ioType {nonIO = 0, isRead = 1, isReadV = 2, isWrite = 3,
-                                    isReadP = 4, isWriteP= 5};
+                                    isReadP = 4, isWriteP= 5, isReadPV= 6};
 
 static XrdPosixFileRH  *Alloc(XrdOucCacheIOCB *cbp, XrdPosixFile *fp,
                               long long offs, int xResult, ioType typeIO);
@@ -64,15 +64,25 @@ static XrdPosixFileRH  *Alloc(XrdOucCacheIOCB *cbp, XrdPosixFile *fp,
 
 inline  void            setCSVec(std::vector<uint32_t> *csv, int *csf,
                                  bool fcs=false)
-                                {csVec = csv; csfix = csf; csFrc = fcs;}
+                                {csVec = csv; csVecN = 1; csfix = csf;
+                                 csFrc = fcs;}
+
+//! Set the destination for a vector pgRead: csv points to an array of n
+//! checksum vectors, one per element of the request vector.
+
+inline  void            setCSVecV(std::vector<uint32_t> *csv, int n, int *csf,
+                                  bool fcs=false)
+                                 {csVec = csv; csVecN = n; csfix = csf;
+                                  csFrc = fcs;}
 
 static  void            SetMax(int mval) {maxFree = mval;}
 
         void            Sched(int result);
 
 private:
-             XrdPosixFileRH() : theCB(0), theFile(0), csVec(0), csfix(0),
-                                result(0),typeIO(nonIO), csFrc(false) {}
+             XrdPosixFileRH() : theCB(0), theFile(0), csVec(0), csVecN(0),
+                                csfix(0), result(0),typeIO(nonIO),
+                                csFrc(false) {}
 virtual     ~XrdPosixFileRH() {}
 
 static  XrdSysMutex      myMutex;
@@ -85,6 +95,7 @@ union  {XrdOucCacheIOCB *theCB;
        };
 XrdPosixFile            *theFile;
 std::vector<uint32_t>   *csVec;
+int                      csVecN;
 int                     *csfix;
 long long                offset;
 int                      result;

@@ -248,6 +248,60 @@ virtual void pgRead(XrdOucCacheIOCB       &iocb,
                    {iocb.Done(pgRead(buff, offs, rdlen, csvec, opts, csfix));}
 
 //-----------------------------------------------------------------------------
+//! Read file pages for a vector of extents and return their checksums.
+//!
+//! This is the vector form of pgRead: the extents are read in one operation
+//! where the underlying I/O supports it, and each one comes back with its own
+//! checksum vector. The default implementation loops over pgRead(), so every
+//! existing XrdOucCacheIO keeps working unchanged.
+//!
+//! @param  readV pointer to a vector of read requests.
+//! @param  rnum  the number of elements in the vector.
+//! @param  csvec pointer to an array of rnum vectors; entry i is filled with
+//!               the CRC32C checksum of each page or page segment of element i
+//!               of readV. Must not be nil. An entry left zero length means
+//!               checksums are not present for that element.
+//! @param  opts  Processing options:
+//!               forceCS - always return checksums even when not available.
+//! @param  csfix When not nil, returns the number of corrected checksum errs
+//!               summed over all elements.
+//!
+//! @return >= 0      The total number of bytes placed in the buffers.
+//! @return -errno    The vector could not be read, return value is the reason.
+//!                   As for ReadV(), a short read of any element is a failure.
+//-----------------------------------------------------------------------------
+
+virtual int  pgReadV(const XrdOucIOVec     *readV,
+                     int                    rnum,
+                     std::vector<uint32_t> *csvec,
+                     uint64_t               opts=0,
+                     int                   *csfix=0);
+
+//-----------------------------------------------------------------------------
+//! Read file pages for a vector of extents using asynchronous I/O
+//! (default sync).
+//!
+//! @param  iocb  reference to the callback object that receives the result. All
+//!               results are returned via this object's Done() method. If the
+//!               caller holds any locks they must be recursive locks as the
+//!               callback may occur on the calling thread.
+//! @param  readV pointer to a vector of read requests.
+//! @param  rnum  the number of elements in the vector.
+//! @param  csvec pointer to an array of rnum checksum vectors, see above.
+//! @param  opts  Processing options:
+//!               forceCS - always return checksums even when not available.
+//! @param  csfix When not nil, returns the number of corrected checksum errs.
+//-----------------------------------------------------------------------------
+
+virtual void pgReadV(XrdOucCacheIOCB       &iocb,
+                     const XrdOucIOVec     *readV,
+                     int                    rnum,
+                     std::vector<uint32_t> *csvec,
+                     uint64_t               opts=0,
+                     int                   *csfix=0)
+                    {iocb.Done(pgReadV(readV, rnum, csvec, opts, csfix));}
+
+//-----------------------------------------------------------------------------
 //! Write file pages from a buffer and corresponding verified checksums.
 //!
 //! @param  buff  pointer to buffer holding the bytes to be written.

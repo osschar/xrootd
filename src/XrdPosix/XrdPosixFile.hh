@@ -127,6 +127,15 @@ static void          DelayedDestroy(XrdPosixFile *fp);
                             std::vector<uint32_t> &csvec, uint64_t opts=0,
                             int *csfix=0) override;
 
+       int           pgReadV(const XrdOucIOVec *readV, int rnum,
+                             std::vector<uint32_t> *csvec, uint64_t opts=0,
+                             int *csfix=0) override;
+
+       void          pgReadV(XrdOucCacheIOCB &iocb,
+                             const XrdOucIOVec *readV, int rnum,
+                             std::vector<uint32_t> *csvec, uint64_t opts=0,
+                             int *csfix=0) override;
+
         int          pgWrite(char *buff, long long offs, int wrlen,
                              std::vector<uint32_t> &csvec, uint64_t opts=0,
                              int *csfix=0) override;
