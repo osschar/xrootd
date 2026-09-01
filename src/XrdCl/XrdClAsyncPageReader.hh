@@ -57,13 +57,20 @@ class AsyncPageReader
         iovcnt( 0 ),
         iovindex( 0 )
     {
-      uint64_t rdoff = chunks.front().offset;
-      uint32_t rdlen = 0;
+      //------------------------------------------------------------------------
+      // Each chunk owns a range of the digest vector, since the chunks of a
+      // pgreadv are separate extents of the file and each one is paged from
+      // its own offset. For a pgread, which always has exactly one chunk, this
+      // is the whole vector and comes to the same thing as before.
+      //------------------------------------------------------------------------
+      dgbase.reserve( chunks.size() + 1 );
+      dgbase.push_back( 0 );
       for( auto &ch : chunks )
-        rdlen += ch.length;
-      int fpglen, lpglen;
-      int pgcnt = XrdOucPgrwUtils::csNum( rdoff, rdlen, fpglen, lpglen);
-      digests.resize( pgcnt );
+        dgbase.push_back( dgbase.back() +
+                          ( ch.length ? XrdOucPgrwUtils::csNum( ch.offset,
+                                                                ch.length ) : 0 ) );
+      digests.resize( dgbase.back() );
+      chbytes.resize( chunks.size(), 0 );
     }
 
     //--------------------------------------------------------------------------
@@ -81,21 +88,48 @@ class AsyncPageReader
       dlen = rsp->status.bdy.dlen;
       rspoff = rsp->info.pgread.offset;
 
-      uint64_t bufoff = rspoff - chunks[0].offset;
-      chindex = 0;
-
+      //------------------------------------------------------------------------
+      // Find the extent this response belongs to. The chunks of a pgreadv are
+      // disjoint and need not be in file order, so the only thing that locates
+      // a response is which extent contains its offset -- walking the chunks
+      // by cumulative length, as a contiguous read allows, does not work here.
+      //------------------------------------------------------------------------
       for( chindex = 0; chindex < chunks.size(); ++chindex )
+        if( rspoff >= chunks[chindex].offset &&
+            rspoff <  chunks[chindex].offset + chunks[chindex].length )
+          break;
+
+      if( chindex >= chunks.size() )
       {
-        if( chunks[chindex].length < bufoff )
-        {
-          bufoff -= chunks[chindex].length;
-          continue;
-        }
-        break;
+        //----------------------------------------------------------------------
+        // No extent holds it. The server does this legitimately for the empty
+        // final result that closes a read which returned nothing, in which
+        // case dlen is zero and Read() will not touch anything. Anything else
+        // is a bad response and is left to the message handler to notice.
+        //----------------------------------------------------------------------
+        choff   = 0;
+        dgindex = dgbase.back();
+        return;
       }
-      choff   = bufoff;
-      dgindex = rspoff/XrdSys::PageSize - chunks[0].offset/XrdSys::PageSize;
+
+      uint64_t delta = rspoff - chunks[chindex].offset;
+      choff   = delta;
+      dgindex = dgbase[chindex] +
+                ( delta ? XrdOucPgrwUtils::csNum( chunks[chindex].offset,
+                                                  delta ) : 0 );
+      dgoff   = 0;
     }
+
+    //--------------------------------------------------------------------------
+    //! @return : the first digest index of each chunk, plus the total as the
+    //!           last entry, so entry i+1 is the end of chunk i's range
+    //--------------------------------------------------------------------------
+    const std::vector<size_t>& DigestBase() const { return dgbase; }
+
+    //--------------------------------------------------------------------------
+    //! @return : number of bytes placed into each chunk's buffer
+    //--------------------------------------------------------------------------
+    const std::vector<uint32_t>& ChunkBytes() const { return chbytes; }
 
     //--------------------------------------------------------------------------
     //! Readout data from the socket
@@ -183,8 +217,11 @@ class AsyncPageReader
       uint32_t dleft = dlen;
       // space in our page buffer
       uint32_t pgspace = chunks[chindex].length - choff;
-      // space in our digest buffer
-      uint32_t dgspace = sizeof( uint32_t ) * (digests.size() - dgindex ) - dgoff;
+      // space in the current chunk's digest range, which a single response
+      // never leaves, since a response carries data of one extent only
+      size_t   dgend   = dgbase[chindex+1];
+      uint32_t dgspace = ( dgend > dgindex
+                         ? sizeof( uint32_t ) * ( dgend - dgindex ) - dgoff : 0 );
       if( dleft > pgspace + dgspace )
         dleft = pgspace + dgspace;
       return dleft;
@@ -315,16 +352,21 @@ class AsyncPageReader
       // if we filled the buffer, move to the next one
       if( iovcnt == 0 )
         iov.clear();
+      // record how much of this chunk we have filled
+      chbytes[chindex] = choff;
       // do we need to move to the next chunk?
       if( choff >= chunks[chindex].length )
       {
         ++chindex;
         choff = 0;
+        if( chindex < chunks.size() ) dgindex = dgbase[chindex];
       }
     }
 
     ChunkList &chunks;              //< list of data chunks to be filled with user data
     std::vector<uint32_t> &digests; //< list of crc32c digests for every 4KB page of data
+    std::vector<size_t>   dgbase;   //< first digest index of each chunk, plus the total
+    std::vector<uint32_t> chbytes;  //< bytes placed into each chunk so far
     uint32_t   dlen;                //< size of the data in the message
     uint64_t   rspoff;              //< response offset
 

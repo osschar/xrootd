@@ -1202,6 +1202,19 @@ namespace XrdCl
         break;
       }
 
+      case kXR_pgreadv:
+      {
+        uint32_t numChunks = (req->pgreadv.dlen)/sizeof(XrdProto::read_list);
+        XrdProto::read_list *dataChunk =
+          (XrdProto::read_list*)( msg + sizeof( ClientRequestHdr ) );
+        for( size_t i = 0; i < numChunks; ++i )
+        {
+          dataChunk[i].rlen   = htonl( dataChunk[i].rlen );
+          dataChunk[i].offset = htonll( dataChunk[i].offset );
+        }
+        break;
+      }
+
       case kXR_clone:
       {
         uint32_t numChunks  = (req->clone.dlen)/sizeof(XrdProto::clone_list);
@@ -1386,6 +1399,7 @@ namespace XrdCl
     switch( reqType )
     {
       case kXR_pgread:
+      case kXR_pgreadv:
       {
         stlen += sizeof( ServerResponseBody_pgRead );
         break;
@@ -1407,6 +1421,7 @@ namespace XrdCl
     switch( reqType )
     {
       case kXR_pgread:
+      case kXR_pgreadv:
       {
         ServerResponseBody_pgRead *pgrdbdy = (ServerResponseBody_pgRead*)msg.GetBuffer( sizeof( ServerResponseStatus ) );
         pgrdbdy->offset = ntohll( pgrdbdy->offset );
@@ -3306,6 +3321,31 @@ namespace XrdCl
         o << "chunks: [";
         uint64_t size      = 0;
         for( size_t i = 0; i < req->dlen/sizeof(readahead_list); ++i )
+        {
+          size += dataChunk[i].rlen;
+          o << "(offset: " << dataChunk[i].offset;
+          o << ", size: " << dataChunk[i].rlen << "); ";
+        }
+        o << "], ";
+        o << "total size: " << size << ")";
+        break;
+      }
+
+      //------------------------------------------------------------------------
+      // kXR_pgreadv
+      //------------------------------------------------------------------------
+      case kXR_pgreadv:
+      {
+        o << "kXR_pgreadv (";
+
+        XrdProto::read_list *dataChunk =
+          (XrdProto::read_list*)( msg + sizeof( ClientRequestHdr ) );
+        o << "handle: " << FileHandleToStr( dataChunk[0].fhandle );
+        o << ", ";
+        o << std::setbase(10);
+        o << "chunks: [";
+        uint64_t size = 0;
+        for( size_t i = 0; i < req->dlen/sizeof(XrdProto::read_list); ++i )
         {
           size += dataChunk[i].rlen;
           o << "(offset: " << dataChunk[i].offset;

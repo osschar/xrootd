@@ -1476,18 +1476,98 @@ namespace XrdCl
 
   //----------------------------------------------------------------------------
   // Read scattered data chunks, with a crc32c per 4KB page (actual
-  // implementation)
-  //
-  // For now this is a loop over PgRead. The API and the response shape are the
-  // ones a single kXR_pgreadv will produce, so callers are already written
-  // against the final interface; and the loop remains as the fallback for
-  // servers that do not know the request.
+  // implementation): one kXR_pgreadv on the wire.
   //----------------------------------------------------------------------------
   XRootDStatus FileStateHandler::PgReadVImpl( std::shared_ptr<FileStateHandler> &self,
                                               const ChunkList                   &chunks,
                                               uint16_t                           flags,
                                               ResponseHandler                   *handler,
                                               time_t                             timeout )
+  {
+    XrdSysMutexHelper scopedLock( self->pMutex );
+
+    if( self->pFileState == Error ) return self->pStatus;
+
+    if( self->pFileState != Opened && self->pFileState != Recovering )
+      return XRootDStatus( stError, errInvalidOp );
+
+    //--------------------------------------------------------------------------
+    // Retry addresses a single page, it never reaches the vector entry point
+    //--------------------------------------------------------------------------
+    if( flags & PgReadFlags::Retry )
+      return XRootDStatus( stError, errInvalidArgs, EINVAL,
+                           "PgReadV does not support the retry flag." );
+
+    //--------------------------------------------------------------------------
+    // The vector has to fit in one request
+    //--------------------------------------------------------------------------
+    if( chunks.size() > size_t( XrdProto::maxRvecsz ) )
+      return XRootDStatus( stError, errInvalidArgs, EINVAL,
+                           "PgReadV vector is too long." );
+
+    Log *log = DefaultEnv::GetLog();
+    log->Debug( FileMsg, "[%p@%s] Sending a pgreadv command of %zu chunks for "
+                "handle %#x to %s",
+                (void*)self.get(), self->pFileUrl->GetObfuscatedURL().c_str(),
+                chunks.size(), *((uint32_t*)self->pFileHandle),
+                self->pDataServer->GetHostId().c_str() );
+
+    //--------------------------------------------------------------------------
+    // Build the message
+    //--------------------------------------------------------------------------
+    const size_t rlSize = sizeof( XrdProto::read_list );
+
+    Message              *msg;
+    ClientPgReadVRequest *req;
+    MessageUtils::CreateRequest( msg, req, rlSize*chunks.size() );
+
+    req->requestid = kXR_pgreadv;
+    req->reqflags  = static_cast<kXR_char>( flags );
+    req->pathid    = 0;
+    req->dlen      = rlSize*chunks.size();
+
+    ChunkList *list = new ChunkList();
+    list->reserve( chunks.size() );
+
+    XrdProto::read_list *rdList = (XrdProto::read_list*)
+                                  msg->GetBuffer( sizeof( ClientPgReadVRequest ) );
+    for( size_t i = 0; i < chunks.size(); ++i )
+    {
+      rdList[i].rlen   = chunks[i].length;
+      rdList[i].offset = chunks[i].offset;
+      memcpy( rdList[i].fhandle, self->pFileHandle, 4 );
+
+      list->push_back( ChunkInfo( chunks[i].offset,
+                                  chunks[i].length,
+                                  chunks[i].buffer ) );
+    }
+
+    //--------------------------------------------------------------------------
+    // Send the message
+    //--------------------------------------------------------------------------
+    XRootDTransport::SetDescription( msg );
+    MessageSendParams params;
+    params.timeout         = timeout;
+    params.followRedirects = false;
+    params.stateful        = true;
+    params.chunkList       = list;
+    MessageUtils::ProcessSendParams( params );
+    StatefulHandler *stHandler = new StatefulHandler( self, handler, msg, params );
+
+    return SendOrQueue( self, *self->pDataServer, msg, stHandler, params );
+  }
+
+  //----------------------------------------------------------------------------
+  // Read scattered data chunks as a loop of PgReads.
+  //
+  // This is the fallback for servers that do not know kXR_pgreadv. Since
+  // PgRead itself substitutes a plain Read where pgread is unsupported, it is
+  // two levels deep and still returns correct checksums.
+  //----------------------------------------------------------------------------
+  XRootDStatus FileStateHandler::PgReadVSubst( std::shared_ptr<FileStateHandler> &self,
+                                               const ChunkList                   &chunks,
+                                               ResponseHandler                   *handler,
+                                               time_t                             timeout )
   {
     //--------------------------------------------------------------------------
     // Sanity check. PgRead re-checks under the lock, this is only so an
@@ -1507,13 +1587,6 @@ namespace XrdCl
                   chunks.size(), *((uint32_t*)self->pFileHandle),
                   self->pDataServer->GetHostId().c_str() );
     }
-
-    //--------------------------------------------------------------------------
-    // Retry is a single-page affair, it never reaches the vector entry point
-    //--------------------------------------------------------------------------
-    if( flags & PgReadFlags::Retry )
-      return XRootDStatus( stError, errInvalidArgs, EINVAL,
-                           "PgReadV does not support the retry flag." );
 
     //--------------------------------------------------------------------------
     // From here on the handler is ours: every extent reports through the

@@ -343,6 +343,24 @@ namespace XrdCl
                                        time_t                             timeout = 0 );
 
       //------------------------------------------------------------------------
+      //! Read scattered data chunks as a loop of PgReads, the fallback used
+      //! when a single kXR_pgreadv cannot be sent
+      //!
+      //! @param chunks  : list of the chunks to be read and buffers to put the
+      //!                  data in
+      //! @param handler : handler to be notified when the response arrives, the
+      //!                  response parameter will hold a VectorPgReadInfo
+      //!                  object if the procedure was successful
+      //! @param timeout : timeout value, if 0 environment default will be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      static XRootDStatus PgReadVSubst( std::shared_ptr<FileStateHandler> &self,
+                                        const ChunkList                   &chunks,
+                                        ResponseHandler                   *handler,
+                                        time_t                             timeout = 0 );
+
+      //------------------------------------------------------------------------
       //! Write a data chunk at a given offset - async
       //!
       //! @param offset  offset from the beginning of the file
