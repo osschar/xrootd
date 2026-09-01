@@ -204,6 +204,104 @@ int XrdXrootdProtocol::do_PgRead()
 }
 
 /******************************************************************************/
+/*                            d o _ P g R e a d V                             */
+/******************************************************************************/
+
+// The vector form of pgread. The request payload is a kXR_readv read_list and
+// the response is the ordinary pgread stream of partial results, each carrying
+// the file offset of the data it holds, so the offsets simply jump between the
+// requested extents instead of advancing sequentially. Only the last partial
+// of the last extent is flagged kXR_FinalResult.
+
+int XrdXrootdProtocol::do_PgReadV()
+{
+   const int rlSZ = sizeof(XrdProto::read_list);
+
+   struct XrdOucIOVec  rdVec[XrdProto::maxRvecsz];
+   XrdProto::read_list *rlP;
+   int currFH, rdVecNum, rdVecLen = Request.header.dlen;
+   int pathID = static_cast<int>(Request.pgreadv.pathid);
+
+// Compute the number of elements and make sure we have no partial ones
+//
+   rdVecNum = rdVecLen / rlSZ;
+   if (rdVecNum <= 0 || rdVecNum*rlSZ != rdVecLen)
+      return Response.Send(kXR_ArgInvalid, "pgread vector is invalid");
+
+// We must be able to copy the vector to our local stack, both to impose a
+// limit on its size and because do_PgRIO() reuses the request data buffer.
+//
+   if (rdVecNum > XrdProto::maxRvecsz)
+      return Response.Send(kXR_ArgTooLong, "pgread vector is too long");
+
+// An alternate path is not supported, as it is not for kXR_readv. Rejecting it
+// rather than ignoring it keeps a client that asked for one from waiting on a
+// path the response will never arrive on.
+//
+   if (pathID)
+      return Response.Send(kXR_ArgInvalid, "pgreadv does not support a pathid");
+
+// Pick up the request flags
+//
+   IO.Flags = static_cast<unsigned short>(Request.pgreadv.reqflags);
+
+// Copy the vector to the stack, validating as we go
+//
+   rlP = (XrdProto::read_list *)argp->buff;
+   for (int i = 0; i < rdVecNum; i++)
+       {rdVec[i].size = ntohl(rlP[i].rlen);
+        if (rdVec[i].size <= 0)
+           return Response.Send(kXR_ArgInvalid, "pgreadv length is invalid");
+        rdVec[i].offset = ntohll(rlP[i].offset);
+        memcpy(&rdVec[i].info, rlP[i].fhandle, sizeof(int));
+       }
+
+// Check that we have at least one file open
+//
+   if (!FTab)
+      return Response.Send(kXR_FileNotOpen,
+                           "pgreadv does not refer to an open file");
+
+// Now stream the extents, one at a time. Each one is a complete pgread as far
+// as do_PgRIO() is concerned, except that only the last may finalize.
+//
+   currFH = rdVec[0].info + 1;  // Force the first lookup
+   for (int i = 0; i < rdVecNum; i++)
+       {if (rdVec[i].info != currFH)
+           {currFH = rdVec[i].info;
+            if (!(IO.File = FTab->Get(currFH)))
+               return Response.Send(kXR_FileNotOpen,
+                                    "pgreadv does not refer to an open file");
+           }
+
+        IO.Offset = rdVec[i].offset;
+        IO.IOLen  = rdVec[i].size;
+        numReads++;
+
+        TRACEP(FSIO,"fh=" <<currFH<<" pgreadv "<<IO.IOLen<<'@'<<IO.Offset
+                          <<" fn=" <<IO.File->FileKey);
+
+//      If we are monitoring, insert a read entry. As for the statistics
+//      below, an element is reported exactly as a pgread of it would be;
+//      whether the batching itself deserves its own vType is undecided.
+//
+        if (Monitor.InOut())
+           Monitor.Agent->Add_rd(IO.File->Stats.FileID, htonl(IO.IOLen),
+                                                       htonll(IO.Offset));
+
+        IO.File->Stats.pgrOps(IO.IOLen,
+                              (IO.Flags & XrdProto::kXR_pgRetry) != 0);
+
+        int rc = do_PgRIO(i == rdVecNum-1);
+        if (rc) return rc;
+       }
+
+// All done
+//
+   return 0;
+}
+
+/******************************************************************************/
 /*                              d o _ P g R I O                               */
 /******************************************************************************/
 
@@ -212,6 +310,17 @@ int XrdXrootdProtocol::do_PgRead()
 // IO.IOLen  = Number of bytes to read from file and write to socket
 
 int XrdXrootdProtocol::do_PgRIO()
+{
+   return do_PgRIO(true);
+}
+
+/******************************************************************************/
+
+// isLast    = This is the last extent of the request, so its final partial
+//             result is the one that carries kXR_FinalResult. When false the
+//             stream is left open for the extents that follow.
+
+int XrdXrootdProtocol::do_PgRIO(bool isLast)
 {
 // We restrict the maximum transfer size to generate no more than 1023 iovec
 // elements where the first is used for the header.
@@ -238,7 +347,7 @@ int XrdXrootdProtocol::do_PgRIO()
 
 // Preinitialize the header
 //
-   pgrResp.rsp.bdy.requestid = kXR_pgread - kXR_1stRequest;
+   pgrResp.rsp.bdy.requestid = Request.header.requestid - kXR_1stRequest;
    pgrResp.rsp.bdy.resptype  = XrdProto::kXR_PartialResult;;
    memset(pgrResp.rsp.bdy.reserved, 0, sizeof(pgrResp.rsp.bdy.reserved));
 
@@ -311,7 +420,7 @@ int XrdXrootdProtocol::do_PgRIO()
        if (items > 1) iov[items<<1].iov_len = lLen;
 
        if (xframt < rLen || xframt == IO.IOLen)
-          {pgrResp.rsp.bdy.resptype = XrdProto::kXR_FinalResult;
+          {if (isLast) pgrResp.rsp.bdy.resptype = XrdProto::kXR_FinalResult;
            IO.IOLen = 0;
           } else {
            IO.IOLen -= xframt; IO.Offset += xframt;
@@ -343,9 +452,10 @@ int XrdXrootdProtocol::do_PgRIO()
 //
    if (xframt < 0) return fsError(xframt, 0, sfsP->error, 0, 0);
 
-// Return no bytes if we were tricked into sending a partial result
+// Return no bytes if we were tricked into sending a partial result. For any
+// but the last extent there is nothing to finalize, the stream continues.
 //
-   if (pgrResp.rsp.bdy.resptype != XrdProto::kXR_FinalResult)
+   if (isLast && pgrResp.rsp.bdy.resptype != XrdProto::kXR_FinalResult)
       {pgrResp.rsp.bdy.resptype = XrdProto::kXR_FinalResult;
        pgrResp.rsp.bdy.dlen     = 0;
        pgrResp.ofs              = htonll(IO.Offset);
