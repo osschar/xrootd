@@ -62,6 +62,39 @@ int XrdOucCacheIO::pgRead(char                  *buff,
 }
 
 /******************************************************************************/
+/*                               p g R e a d V                                */
+/******************************************************************************/
+
+int XrdOucCacheIO::pgReadV(const XrdOucIOVec     *readV,
+                           int                    rnum,
+                           std::vector<uint32_t> *csvec,
+                           uint64_t               opts,
+                           int                   *csfix)
+{
+   int nbytes = 0, curCount = 0, fixTotal = 0;
+
+// Read the elements one at a time. As for ReadV(), a short read of any element
+// is a failure of the whole vector.
+//
+   for (int i = 0; i < rnum; i++)
+       {int fixOne = 0;
+        curCount = pgRead(readV[i].data, readV[i].offset, readV[i].size,
+                          csvec[i], opts, (csfix ? &fixOne : 0));
+        fixTotal += fixOne;
+        if (curCount != readV[i].size)
+           {if (csfix) *csfix = fixTotal;
+            return (curCount < 0 ? curCount : -ESPIPE);
+           }
+        nbytes += curCount;
+       }
+
+// All done
+//
+   if (csfix) *csfix = fixTotal;
+   return nbytes;
+}
+
+/******************************************************************************/
 /*                               p g W r i t e                                */
 /******************************************************************************/
 

@@ -266,7 +266,9 @@ enum RD_func {RD_chmod = 0, RD_chksum,  RD_dirlist, RD_locate, RD_mkdir,
        int   do_Open();
        bool  do_PgClose(XrdXrootdFile *fP, int &rc);
        int   do_PgRead();
+       int   do_PgReadV();
        int   do_PgRIO();
+       int   do_PgRIO(bool isLast);
        int   do_PgWrite();
        bool  do_PgWAIO(int &rc);
        int   do_PgWIO();

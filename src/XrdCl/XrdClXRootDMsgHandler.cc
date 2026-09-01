@@ -368,7 +368,7 @@ namespace XrdCl
     // Decide the actions that we need to take
     //--------------------------------------------------------------------------
     uint16_t action = 0;
-    if( reqId == kXR_pgread )
+    if( reqId == kXR_pgread || reqId == kXR_pgreadv )
     {
       //----------------------------------------------------------------------
       // The message contains only Status header and body but no raw data
@@ -913,7 +913,7 @@ namespace XrdCl
     ClientRequest *req = (ClientRequest *)pRequest->GetBuffer();
     uint16_t reqId = ntohs( req->header.requestid );
 
-    if( reqId == kXR_pgread )
+    if( reqId == kXR_pgread || reqId == kXR_pgreadv )
       return pPageReader->Read( *socket, bytesRead );
 
     return pBodyReader->Read( *socket, bytesRead );
@@ -1699,6 +1699,76 @@ namespace XrdCl
                                          std::move( pCrc32cDigests) );
 
         obj->Set( pgInfo );
+        response = obj;
+        return Status();
+      }
+
+      //------------------------------------------------------------------------
+      // kXR_pgreadv
+      //------------------------------------------------------------------------
+      case kXR_pgreadv:
+      {
+        log->Dump( XRootDMsg, "[%s] Parsing the response to %s as "
+                   "VectorPgReadInfo", pUrl.GetHostId().c_str(),
+                   pRequest->GetObfuscatedDescription().c_str() );
+
+        if( !pPageReader )
+          return Status( stError, errInvalidResponse );
+
+        //----------------------------------------------------------------------
+        // The page reader placed the data and the digests; it also knows how
+        // much of each extent actually arrived and which slice of the digest
+        // vector belongs to it.
+        //----------------------------------------------------------------------
+        const std::vector<size_t>   &dgbase = pPageReader->DigestBase();
+        const std::vector<uint32_t> &chbts  = pPageReader->ChunkBytes();
+
+        if( dgbase.size() != pChunkList->size() + 1 ||
+            chbts.size()  != pChunkList->size() )
+          return Status( stError, errInternal );
+
+        VectorPgReadInfo *vinfo = new VectorPgReadInfo();
+        std::vector<PageInfo> &pages = vinfo->GetPages();
+        pages.reserve( pChunkList->size() );
+
+        uint32_t total = 0;
+        for( size_t i = 0; i < pChunkList->size(); ++i )
+        {
+          ChunkInfo &ch  = (*pChunkList)[i];
+          uint32_t   len = chbts[i];
+
+          if( len > ch.length )
+          {
+            log->Error( XRootDMsg, "[%s] Handling response to %s: got %u bytes "
+                        "for the %u byte extent at %llu.",
+                        pUrl.GetHostId().c_str(),
+                        pRequest->GetObfuscatedDescription().c_str(),
+                        len, ch.length, (unsigned long long)ch.offset );
+            delete vinfo;
+            return Status( stError, errInvalidResponse );
+          }
+
+          //--------------------------------------------------------------------
+          // The digest range was sized for the full extent; a short extent
+          // fills only its first pages.
+          //--------------------------------------------------------------------
+          size_t ndg = ( len ? XrdOucPgrwUtils::csNum( ch.offset, len ) : 0 );
+          if( dgbase[i] + ndg > pCrc32cDigests.size() )
+          {
+            delete vinfo;
+            return Status( stError, errInternal );
+          }
+
+          std::vector<uint32_t> cksums( pCrc32cDigests.begin() + dgbase[i],
+                                        pCrc32cDigests.begin() + dgbase[i] + ndg );
+          pages.emplace_back( ch.offset, len, ch.buffer, std::move( cksums ) );
+          total += len;
+        }
+
+        vinfo->SetSize( total );
+
+        AnyObject *obj = new AnyObject();
+        obj->Set( vinfo );
         response = obj;
         return Status();
       }

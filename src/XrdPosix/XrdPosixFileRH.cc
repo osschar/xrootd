@@ -28,6 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <cerrno>
 #include <utility>
 #include <vector>
 
@@ -93,6 +94,7 @@ XrdPosixFileRH *XrdPosixFileRH::Alloc(XrdOucCacheIOCB *cbp,
    newCB->theCB   = cbp;
    newCB->theFile = fp;
    newCB->csVec   = 0;
+   newCB->csVecN  = 0;
    newCB->csfix   = 0;
    newCB->offset  = offs;
    newCB->result  = xResult;
@@ -143,6 +145,42 @@ void XrdPosixFileRH::HandleResponse(XrdCl::XRootDStatus *status,
                } else {
                 result = 0;
                 if (csVec) {csVec->clear(); csVec = 0;}
+               }
+           }
+   else if (typeIO == isReadPV)
+           {XrdCl::VectorPgReadInfo *vInfo = 0;
+            union {uint32_t ubRead; int ibRead;};
+            int expect = result;  // Alloc() preset it to the total requested
+            response->Get(vInfo);
+            if (vInfo)
+               {ubRead = vInfo->GetSize();
+                //------------------------------------------------------------
+                // A vector read is all or nothing, as it is for ReadV(); the
+                // individual pgReads it is assembled from are not.
+                //------------------------------------------------------------
+                result = (ibRead == expect ? ibRead : -ESPIPE);
+                if (csVec)
+                   {std::vector<XrdCl::PageInfo> &pgv = vInfo->GetPages();
+                    int n = (csVecN < (int)pgv.size() ? csVecN : (int)pgv.size());
+                    for (int i = 0; i < n; i++)
+                        {uint32_t plen = pgv[i].GetLength();
+                         if (!csFrc || pgv[i].GetCksums().size() != 0 || !plen)
+                            csVec[i] = std::move(pgv[i].GetCksums());
+                            else XrdOucPgrwUtils::csCalc(
+                                     (const char *)pgv[i].GetBuffer(),
+                                     (ssize_t)pgv[i].GetOffset(),
+                                     (size_t)plen, csVec[i]);
+                        }
+                    for (int i = n; i < csVecN; i++) csVec[i].clear();
+                    csVec = 0;
+                   }
+                if (csfix) *csfix = vInfo->GetNbRepair();
+               } else {
+                result = -ESPIPE;
+                if (csVec)
+                   {for (int i = 0; i < csVecN; i++) csVec[i].clear();
+                    csVec = 0;
+                   }
                }
            }
    else if (typeIO == isWrite) theFile->UpdtSize(offset+result);

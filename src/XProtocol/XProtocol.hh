@@ -67,13 +67,14 @@
 // upper limit (i.e. n.9.9 + 1 -> n+1.0.0). The kXR_PROTSIGNVERSION defines the
 // protocol version where request signing became available.
 //
-#define kXR_PROTOCOLVERSION  0x00000520
+#define kXR_PROTOCOLVERSION  0x00000521
 #define kXR_PROTXATTVERSION  0x00000500
 #define kXR_PROTTLSVERSION   0x00000500
 #define kXR_PROTPGRWVERSION  0x00000511
+#define kXR_PROTPGRVVERSION  0x00000521
 #define kXR_PROTCLONEVERSION 0x00000520
 #define kXR_PROTSIGNVERSION  0x00000310
-#define kXR_PROTOCOLVSTRING "5.2.0"
+#define kXR_PROTOCOLVSTRING "5.2.1"
 
 /******************************************************************************/
 /*               C l i e n t - S e r v e r   H a n d s h a k e                */
@@ -143,6 +144,7 @@ enum XRequestTypes {
    kXR_pgread,  // 3030 was kXR_decrypt
    kXR_writev,  // 3031
    kXR_clone,   // 3032
+   kXR_pgreadv, // 3033
    kXR_REQFENCE // Always last valid request code +1
 };
 
@@ -556,6 +558,33 @@ namespace
 }
 
 /******************************************************************************/
+/*                   k X R _ p g r e a d v   R e q u e s t                    */
+/******************************************************************************/
+
+// The vector form of kXR_pgread. The request is a kXR_readv request payload --
+// an array of XrdProto::read_list elements, see the kXR_readv section below --
+// and the response is a kXR_pgread response: a stream of kXR_PartialResult
+// messages, each a ServerResponseStatus followed by the file offset of the data
+// it carries and then the {crc32c, page} pairs. Since ServerResponseBody_pgRead
+// is already offset-addressed, no new response struct is needed; the offsets
+// simply jump between the requested extents instead of advancing sequentially.
+//
+// The element count is capped by XrdProto::maxRvecsz and the per-element length
+// by the server's maxPGRD, exactly as for kXR_readv and kXR_pgread. pathid is
+// kept at the same offset as in ClientReadVRequest so that the two share the
+// server's pathid handling.
+//
+struct ClientPgReadVRequest {
+   kXR_char  streamid[2];
+   kXR_unt16 requestid;
+   kXR_char  reserved[14];
+   kXR_char  reqflags;
+   kXR_char  pathid;
+   kXR_int32 dlen;
+// This struct followed by the read_list
+};
+
+/******************************************************************************/
 /*                   k X R _ p r w r i t e   R e q u e s t                    */
 /******************************************************************************/
 
@@ -901,6 +930,7 @@ typedef union {
    struct ClientMvRequest mv;
    struct ClientOpenRequest open;
    struct ClientPgReadRequest pgread;
+   struct ClientPgReadVRequest pgreadv;
    struct ClientPgWriteRequest pgwrite;
    struct ClientPingRequest ping;
    struct ClientPrepareRequest prepare;

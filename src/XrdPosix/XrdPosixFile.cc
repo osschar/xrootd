@@ -553,6 +553,76 @@ void XrdPosixFile::pgRead(XrdOucCacheIOCB       &iocb,
 }
 
 /******************************************************************************/
+/*                               p g R e a d V                                */
+/******************************************************************************/
+
+int XrdPosixFile::pgReadV(const XrdOucIOVec     *readV,
+                          int                    rnum,
+                          std::vector<uint32_t> *csvec,
+                          uint64_t               opts,
+                          int                   *csfix)
+{
+// Do a sync call using the async interface
+//
+   pgioCB pgrCB("Posix pgReadV CB");
+   pgReadV(pgrCB, readV, rnum, csvec, opts, csfix);
+   return pgrCB.Wait4PGIO();
+}
+
+/******************************************************************************/
+
+void XrdPosixFile::pgReadV(XrdOucCacheIOCB       &iocb,
+                           const XrdOucIOVec     *readV,
+                           int                    rnum,
+                           std::vector<uint32_t> *csvec,
+                           uint64_t               opts,
+                           int                   *csfix)
+{
+   XrdCl::XRootDStatus Status;
+   XrdCl::ChunkList    chunkVec;
+   XrdPosixFileRH     *rhP;
+   int nbytes = 0;
+
+// An empty vector has no offset to report and nothing to read
+//
+   if (rnum <= 0) {iocb.Done(rnum < 0 ? -EINVAL : 0); return;}
+
+// Copy in the vector (would be nice if we didn't need to do this)
+//
+   chunkVec.reserve(rnum);
+   for (int i = 0; i < rnum; i++)
+       {nbytes += readV[i].size;
+        chunkVec.push_back(XrdCl::ChunkInfo((uint64_t)readV[i].offset,
+                                            (uint32_t)readV[i].size,
+                                            (void   *)readV[i].data
+                                           ));
+       }
+
+// Allocate callback object. Note the response handler may do additional post
+// processing.
+//
+   rhP = XrdPosixFileRH::Alloc(&iocb, this, readV[0].offset, nbytes,
+                               XrdPosixFileRH::isReadPV);
+
+// Set the destination checksum vectors, one per element
+//
+   if (csfix) *csfix = 0;
+   rhP->setCSVecV(csvec, rnum, csfix, (opts & XrdOucCacheIO::forceCS) != 0);
+
+// Issue the read
+//
+   Ref();
+   Status = clFile.PgReadV(chunkVec, rhP);
+
+// Check status, upon error we pass -errno as the result.
+//
+   if (!Status.IsOK())
+      {rhP->Sched(XrdPosixMap::Result(Status, ecMsg, false));
+       unRef();
+      }
+}
+
+/******************************************************************************/
 /*                               p g W r i t e                                */
 /******************************************************************************/
 

@@ -56,6 +56,37 @@ int         Open() {Init(); return openRC;}
 
 const char *Path()  {return fileP->Path();}
 
+//! pgRead and pgReadV must be forwarded, not left to the XrdOucCacheIO
+//! defaults. Those defaults fall back on Read(), which this class does
+//! override, so the data would still be correct -- but the checksums would be
+//! silently lost, and a caller that asked for end-to-end checksums has no way
+//! to tell that from an origin which cannot supply them. XrdPfc, for one,
+//! concludes the latter and permanently marks the file as having none.
+
+int         pgRead(char *buff, long long offs, int rdlen,
+                   std::vector<uint32_t> &csvec, uint64_t opts=0, int *csfix=0)
+                  {return (Init() ? fileP->pgRead(buff, offs, rdlen, csvec,
+                                                  opts, csfix) : openRC);}
+
+void        pgRead(XrdOucCacheIOCB &iocb, char *buff, long long offs, int rdlen,
+                   std::vector<uint32_t> &csvec, uint64_t opts=0, int *csfix=0)
+                  {if (Init(&iocb))
+                      fileP->pgRead(iocb, buff, offs, rdlen, csvec, opts, csfix);
+                      else iocb.Done(openRC);
+                  }
+
+int         pgReadV(const XrdOucIOVec *readV, int rnum,
+                    std::vector<uint32_t> *csvec, uint64_t opts=0, int *csfix=0)
+                   {return (Init() ? fileP->pgReadV(readV, rnum, csvec,
+                                                    opts, csfix) : openRC);}
+
+void        pgReadV(XrdOucCacheIOCB &iocb, const XrdOucIOVec *readV, int rnum,
+                    std::vector<uint32_t> *csvec, uint64_t opts=0, int *csfix=0)
+                   {if (Init(&iocb))
+                       fileP->pgReadV(iocb, readV, rnum, csvec, opts, csfix);
+                       else iocb.Done(openRC);
+                   }
+
 int         Read (char *Buffer, long long Offset, int Length)
                  {return (Init() ? fileP->Read(Buffer, Offset, Length) : openRC);}
 

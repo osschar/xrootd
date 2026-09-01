@@ -489,6 +489,7 @@ int XrdXrootdProtocol::Process2()
           case kXR_write:    return do_Write();
           case kXR_writev:   return do_WriteV();
           case kXR_pgread:   return do_PgRead();
+          case kXR_pgreadv:  return do_PgReadV();
           case kXR_pgwrite:  return do_PgWrite();
           case kXR_sync:     ReqID.setID(Request.header.streamid);
                              return do_Sync();

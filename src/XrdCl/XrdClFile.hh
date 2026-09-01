@@ -319,6 +319,47 @@ namespace XrdCl
                            XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
+      //! Read scattered data chunks, with a crc32c per 4KB page - async
+      //!
+      //! The vector form of PgRead: the extents are read in one operation and
+      //! each comes back with its own checksum vector.
+      //!
+      //! @param chunks  list of the chunks to be read and buffers to put the
+      //!                data in. The same limits as for VectorRead apply: the
+      //!                default maximum number of chunks per request is 1024
+      //!                and the server may be queried using FileSystem::Query
+      //!                for the actual settings.
+      //! @param handler handler to be notified when the response arrives, the
+      //!                response parameter will hold a VectorPgReadInfo object
+      //!                if the procedure was successful
+      //! @param timeout timeout value, if 0 the environment default will be
+      //!                used
+      //! @return        status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus PgReadV( const ChunkList &chunks,
+                            ResponseHandler *handler,
+                            time_t           timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
+      //! Read scattered data chunks, with a crc32c per 4KB page - sync
+      //!
+      //! @param chunks    list of the chunks to be read and buffers to put the
+      //!                  data in
+      //! @param cksums    on return holds, for each requested extent, the
+      //!                  crc32c of each of its 4KB pages
+      //! @param bytesRead total number of bytes read over all extents
+      //! @param timeout   timeout value, if 0 the environment default will be
+      //!                  used
+      //! @return          status of the operation
+      //------------------------------------------------------------------------
+      XRootDStatus PgReadV( const ChunkList                    &chunks,
+                            std::vector<std::vector<uint32_t>> &cksums,
+                            uint32_t                           &bytesRead,
+                            time_t                              timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
+
+      //------------------------------------------------------------------------
       //! Write a data chunk at a given offset - async
       //! The call interprets and returns the server response, which may be
       //! either a success or a failure, it does not contain the number

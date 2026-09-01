@@ -45,9 +45,12 @@
 
 namespace
 {
+  class PgRetryTarget;
   class PgReadHandler;
   class PgReadRetryHandler;
   class PgReadSubstitutionHandler;
+  class PgReadVHandler;
+  class PgReadVSubstHandler;
   class OpenHandler;
 }
 
@@ -97,6 +100,8 @@ namespace XrdCl
       friend class ::PgReadHandler;
       friend class ::PgReadRetryHandler;
       friend class ::PgReadSubstitutionHandler;
+      friend class ::PgReadVHandler;
+      friend class ::PgReadVSubstHandler;
       friend class ::OpenHandler;
 
     public:
@@ -277,7 +282,7 @@ namespace XrdCl
                                        uint32_t                           size,
                                        size_t                             pgnb,
                                        void                              *buffer,
-                                       PgReadHandler                     *handler,
+                                       PgRetryTarget                     *handler,
                                        time_t                             timeout = 0 );
 
       //------------------------------------------------------------------------
@@ -302,6 +307,68 @@ namespace XrdCl
                                       uint16_t                           flags,
                                       ResponseHandler                   *handler,
                                       time_t                             timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Read scattered data chunks, with a crc32c per 4KB page
+      //!
+      //! @param chunks  : list of the chunks to be read and buffers to put the
+      //!                  data in
+      //! @param handler : handler to be notified when the response arrives, the
+      //!                  response parameter will hold a VectorPgReadInfo
+      //!                  object if the procedure was successful
+      //! @param timeout : timeout value, if 0 environment default will be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      static XRootDStatus PgReadV( std::shared_ptr<FileStateHandler> &self,
+                                   const ChunkList                   &chunks,
+                                   ResponseHandler                   *handler,
+                                   time_t                             timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Read scattered data chunks, with a crc32c per 4KB page (actual
+      //! implementation)
+      //!
+      //! @param chunks  : list of the chunks to be read and buffers to put the
+      //!                  data in
+      //! @param flags   : PgRead flags
+      //! @param handler : handler to be notified when the response arrives, the
+      //!                  response parameter will hold a VectorPgReadInfo
+      //!                  object if the procedure was successful
+      //! @param timeout : timeout value, if 0 environment default will be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      static XRootDStatus PgReadVImpl( std::shared_ptr<FileStateHandler> &self,
+                                       const ChunkList                   &chunks,
+                                       uint16_t                           flags,
+                                       ResponseHandler                   *handler,
+                                       time_t                             timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! Read scattered data chunks as a loop of PgReads, the fallback used
+      //! when a single kXR_pgreadv cannot be sent
+      //!
+      //! @param chunks  : list of the chunks to be read and buffers to put the
+      //!                  data in
+      //! @param handler : handler to be notified when the response arrives, the
+      //!                  response parameter will hold a VectorPgReadInfo
+      //!                  object if the procedure was successful
+      //! @param timeout : timeout value, if 0 environment default will be used
+      //!
+      //! @return        : status of the operation
+      //------------------------------------------------------------------------
+      static XRootDStatus PgReadVSubst( std::shared_ptr<FileStateHandler> &self,
+                                        const ChunkList                   &chunks,
+                                        ResponseHandler                   *handler,
+                                        time_t                             timeout = 0 );
+
+      //------------------------------------------------------------------------
+      //! @return : true if the data server can do a vector pgRead in one
+      //!           request, false if it has to be substituted with a pgRead
+      //!           per extent
+      //------------------------------------------------------------------------
+      static bool PgReadVSupported( std::shared_ptr<FileStateHandler> &self );
 
       //------------------------------------------------------------------------
       //! Write a data chunk at a given offset - async

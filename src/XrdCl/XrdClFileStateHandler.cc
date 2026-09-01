@@ -62,9 +62,41 @@
 namespace
 {
   //----------------------------------------------------------------------------
+  // What a single-page retry reports back to. Implemented by the pgread
+  // verifier and by the pgreadv one; `index` identifies the page within
+  // whatever that verifier is checking, so a corrected checksum can be put
+  // back where it belongs. For pgread that is the page number; for pgreadv it
+  // is a position in the verifier's own table of retried (extent, page) pairs,
+  // which is what gives the (extent, page) addressing the vector form needs.
+  //----------------------------------------------------------------------------
+  class PgRetryTarget
+  {
+    public:
+
+      virtual ~PgRetryTarget() {}
+
+      //------------------------------------------------------------------------
+      // A retried page came back good; put its checksum in place
+      //------------------------------------------------------------------------
+      virtual void UpdateCksum( size_t index, uint32_t crcval ) = 0;
+
+      //------------------------------------------------------------------------
+      // A retry finished, successfully or not
+      //------------------------------------------------------------------------
+      virtual void RetryResponse( XrdCl::XRootDStatus *status,
+                                  XrdCl::AnyObject    *response,
+                                  XrdCl::HostList     *hostList ) = 0;
+
+      //------------------------------------------------------------------------
+      // The file being read, for log messages
+      //------------------------------------------------------------------------
+      virtual std::string RetryUrl() const = 0;
+  };
+
+  //----------------------------------------------------------------------------
   // Helper callback for handling PgRead responses
   //----------------------------------------------------------------------------
-  class PgReadHandler : public XrdCl::ResponseHandler
+  class PgReadHandler : public XrdCl::ResponseHandler, public PgRetryTarget
   {
       friend class PgReadRetryHandler;
 
@@ -215,6 +247,18 @@ namespace
         }
       }
 
+      void RetryResponse( XrdCl::XRootDStatus *status,
+                          XrdCl::AnyObject    *response,
+                          XrdCl::HostList     *hostList )
+      {
+        HandleResponseWithHosts( status, response, hostList );
+      }
+
+      std::string RetryUrl() const
+      {
+        return stateHandler->pFileUrl->GetObfuscatedURL();
+      }
+
     private:
 
       std::shared_ptr<XrdCl::FileStateHandler>  stateHandler;
@@ -239,7 +283,7 @@ namespace
   {
     public:
 
-      PgReadRetryHandler( PgReadHandler *pgReadHandler, size_t pgnb ) : pgReadHandler( pgReadHandler ),
+      PgReadRetryHandler( PgRetryTarget *pgReadHandler, size_t pgnb ) : pgReadHandler( pgReadHandler ),
                                                                         pgnb( pgnb )
       {
 
@@ -258,8 +302,8 @@ namespace
         {
           Log *log = DefaultEnv::GetLog();
           log->Info( FileMsg, "[%p@%s] Failed to recover page #%zu.",
-                     (void*)this, pgReadHandler->stateHandler->pFileUrl->GetObfuscatedURL().c_str(), pgnb );
-          pgReadHandler->HandleResponseWithHosts( status, response, hostList );
+                     (void*)this, pgReadHandler->RetryUrl().c_str(), pgnb );
+          pgReadHandler->RetryResponse( status, response, hostList );
           delete this;
           return;
         }
@@ -270,10 +314,10 @@ namespace
         {
           Log *log = DefaultEnv::GetLog();
           log->Info( FileMsg, "[%p@%s] Failed to recover page #%zu.",
-                     (void*)this, pgReadHandler->stateHandler->pFileUrl->GetObfuscatedURL().c_str(), pgnb );
+                     (void*)this, pgReadHandler->RetryUrl().c_str(), pgnb );
           // we retry a page at a time so the length cannot exceed 4KB
           DeleteArgs( status, response, hostList );
-          pgReadHandler->HandleResponseWithHosts( new XRootDStatus( stError, errDataError ), 0, 0 );
+          pgReadHandler->RetryResponse( new XRootDStatus( stError, errDataError ), 0, 0 );
           delete this;
           return;
         }
@@ -283,20 +327,20 @@ namespace
         {
           Log *log = DefaultEnv::GetLog();
           log->Info( FileMsg, "[%p@%s] Failed to recover page #%zu.",
-                     (void*)this, pgReadHandler->stateHandler->pFileUrl->GetObfuscatedURL().c_str(), pgnb );
+                     (void*)this, pgReadHandler->RetryUrl().c_str(), pgnb );
           DeleteArgs( status, response, hostList );
-          pgReadHandler->HandleResponseWithHosts( new XRootDStatus( stError, errDataError ), 0, 0 );
+          pgReadHandler->RetryResponse( new XRootDStatus( stError, errDataError ), 0, 0 );
           delete this;
           return;
         }
 
         Log *log = DefaultEnv::GetLog();
         log->Info( FileMsg, "[%p@%s] Successfully recovered page #%zu.",
-                   (void*)this, pgReadHandler->stateHandler->pFileUrl->GetObfuscatedURL().c_str(), pgnb );
+                   (void*)this, pgReadHandler->RetryUrl().c_str(), pgnb );
 
         DeleteArgs( 0, response, hostList );
         pgReadHandler->UpdateCksum( pgnb, crcval );
-        pgReadHandler->HandleResponseWithHosts( status, 0, 0 );
+        pgReadHandler->RetryResponse( status, 0, 0 );
         delete this;
       }
 
@@ -311,7 +355,7 @@ namespace
         delete hostList;
       }
 
-      PgReadHandler *pgReadHandler;
+      PgRetryTarget *pgReadHandler;
       size_t         pgnb;
   };
 
@@ -395,6 +439,382 @@ namespace
 
       std::shared_ptr<XrdCl::FileStateHandler>  stateHandler;
       XrdCl::ResponseHandler                   *userHandler;
+  };
+
+  //----------------------------------------------------------------------------
+  // Assembles a PgReadV response out of one PgRead per requested extent.
+  //
+  // This is what is used whenever a single kXR_pgreadv cannot be sent, and it
+  // is what makes File::PgReadV available against every server, including ones
+  // that do not know the request at all -- there PgRead itself substitutes a
+  // plain Read, so the fallback is two levels deep and still correct.
+  //
+  // Lifetime: the object owns its per-extent handlers and deletes itself once
+  // all of them have reported. The count starts one too high, the extra one
+  // being released by IssueDone() when the issuing loop is over, so that an
+  // extent failing to issue cannot destroy the object under that loop's feet.
+  //----------------------------------------------------------------------------
+  class PgReadVSubstHandler
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      // Constructor
+      //------------------------------------------------------------------------
+      PgReadVSubstHandler( XrdCl::ResponseHandler *userHandler, size_t nbext ) :
+        userHandler( userHandler ),
+        vinfo( new XrdCl::VectorPgReadInfo() ),
+        st( new XrdCl::XRootDStatus() ),
+        pending( nbext + 1 )
+      {
+        vinfo->GetPages().resize( nbext );
+        elements.reserve( nbext );
+        for( size_t i = 0; i < nbext; ++i )
+          elements.emplace_back( new Element( this, i ) );
+      }
+
+      //------------------------------------------------------------------------
+      // The handler to be given to the PgRead of extent `index`
+      //------------------------------------------------------------------------
+      XrdCl::ResponseHandler* ElementHandler( size_t index )
+      {
+        return elements[index].get();
+      }
+
+      //------------------------------------------------------------------------
+      // Called once the issuing loop is done, may delete the object
+      //------------------------------------------------------------------------
+      void IssueDone()
+      {
+        Release();
+      }
+
+    private:
+
+      //------------------------------------------------------------------------
+      // Per-extent handler, knows which extent it is serving
+      //------------------------------------------------------------------------
+      class Element : public XrdCl::ResponseHandler
+      {
+        public:
+
+          Element( PgReadVSubstHandler *parent, size_t index ) :
+            parent( parent ), index( index ) {}
+
+          void HandleResponseWithHosts( XrdCl::XRootDStatus *status,
+                                        XrdCl::AnyObject    *response,
+                                        XrdCl::HostList     *hostList )
+          {
+            parent->Complete( index, status, response, hostList );
+          }
+
+        private:
+
+          PgReadVSubstHandler *parent;
+          size_t          index;
+      };
+
+      //------------------------------------------------------------------------
+      // Absorb the response for one extent
+      //------------------------------------------------------------------------
+      void Complete( size_t                index,
+                     XrdCl::XRootDStatus  *status,
+                     XrdCl::AnyObject     *response,
+                     XrdCl::HostList      *hostList )
+      {
+        using namespace XrdCl;
+
+        {
+          std::lock_guard<std::mutex> lck( mtx );
+
+          if( hostList && !hosts ) hosts.reset( hostList );
+          else delete hostList;
+
+          if( status->IsOK() )
+          {
+            PageInfo *pginf = 0;
+            if( response ) response->Get( pginf );
+            if( pginf )
+              //----------------------------------------------------------------
+              // Move assignment swaps the implementations, so the PageInfo left
+              // in the response stays valid for its own destructor.
+              //----------------------------------------------------------------
+              vinfo->GetPages()[index] = std::move( *pginf );
+            else if( st->IsOK() )
+              st.reset( new XRootDStatus( stError, errInternal, 0,
+                                          "PgRead returned no page info." ) );
+            delete status;
+          }
+          else
+          {
+            //------------------------------------------------------------------
+            // Keep the first error, discard the rest
+            //------------------------------------------------------------------
+            if( st->IsOK() ) st.reset( status );
+            else             delete status;
+          }
+
+          delete response;
+        }
+
+        Release();
+      }
+
+      //------------------------------------------------------------------------
+      // Drop one reference, finalize on the last
+      //------------------------------------------------------------------------
+      void Release()
+      {
+        size_t left;
+        {
+          std::lock_guard<std::mutex> lck( mtx );
+          left = --pending;
+        }
+        if( left == 0 ) Finalize();
+      }
+
+      //------------------------------------------------------------------------
+      // Report to the user and commit suicide
+      //------------------------------------------------------------------------
+      void Finalize()
+      {
+        using namespace XrdCl;
+
+        if( st->IsOK() )
+        {
+          uint32_t total = 0;
+          for( auto &pg : vinfo->GetPages() ) total += pg.GetLength();
+          vinfo->SetSize( total );
+
+          AnyObject *response = new AnyObject();
+          response->Set( vinfo.release() );
+          userHandler->HandleResponseWithHosts( st.release(), response,
+                                                hosts.release() );
+        }
+        else
+          userHandler->HandleResponseWithHosts( st.release(), 0, hosts.release() );
+
+        delete this;
+      }
+
+      XrdCl::ResponseHandler                     *userHandler;
+      std::vector<std::unique_ptr<Element>>       elements;
+
+      std::unique_ptr<XrdCl::VectorPgReadInfo>    vinfo;
+      std::unique_ptr<XrdCl::XRootDStatus>        st;
+      std::unique_ptr<XrdCl::HostList>            hosts;
+
+      std::mutex mtx;
+      size_t     pending;
+  };
+
+  //----------------------------------------------------------------------------
+  // Verifies the crc32c of every page of every extent of a PgReadV response
+  // and retries the pages that do not check out.
+  //
+  // This is to PgReadV what PgReadHandler is to PgRead. The difference is the
+  // addressing: a page is an (extent, page) pair here, so the retries are kept
+  // in a table and their position in it is the index the retry reports back
+  // with. The retry request itself is still a single-page kXR_pgread with
+  // kXR_pgRetry -- only the bookkeeping is different.
+  //----------------------------------------------------------------------------
+  class PgReadVHandler : public XrdCl::ResponseHandler, public PgRetryTarget
+  {
+    public:
+
+      //------------------------------------------------------------------------
+      // Constructor
+      //------------------------------------------------------------------------
+      PgReadVHandler( std::shared_ptr<XrdCl::FileStateHandler> &stateHandler,
+                      XrdCl::ResponseHandler                   *userHandler ) :
+        stateHandler( stateHandler ),
+        userHandler( userHandler ),
+        maincall( true ),
+        retrycnt( 0 )
+      {
+      }
+
+      //------------------------------------------------------------------------
+      // Handle the response
+      //------------------------------------------------------------------------
+      void HandleResponseWithHosts( XrdCl::XRootDStatus *status,
+                                    XrdCl::AnyObject    *response,
+                                    XrdCl::HostList     *hostList )
+      {
+        using namespace XrdCl;
+
+        std::unique_lock<std::mutex> lck( mtx );
+
+        if( !maincall )
+        {
+          //--------------------------------------------------------------------
+          // A retry came back
+          //--------------------------------------------------------------------
+          --retrycnt;
+          if( !status->IsOK() )
+            st.reset( status );
+          else
+          {
+            delete status; // by convention other args are null
+          }
+
+          if( retrycnt == 0 ) Finish( lck );
+          return;
+        }
+
+        //----------------------------------------------------------------------
+        // The main request failed
+        //----------------------------------------------------------------------
+        if( !status->IsOK() )
+        {
+          userHandler->HandleResponseWithHosts( status, response, hostList );
+          lck.unlock();
+          delete this;
+          return;
+        }
+
+        maincall = false;
+
+        VectorPgReadInfo *vinf = 0;
+        if( response ) response->Get( vinf );
+        if( !vinf )
+        {
+          userHandler->HandleResponseWithHosts( status, response, hostList );
+          lck.unlock();
+          delete this;
+          return;
+        }
+
+        //----------------------------------------------------------------------
+        // Check every page of every extent
+        //----------------------------------------------------------------------
+        std::vector<PageInfo> &pages = vinf->GetPages();
+        repairs.resize( pages.size(), 0 );
+
+        Log *log = DefaultEnv::GetLog();
+
+        for( size_t e = 0; e < pages.size(); ++e )
+        {
+          uint64_t               pgoff  = pages[e].GetOffset();
+          uint32_t               left   = pages[e].GetLength();
+          std::vector<uint32_t> &cksums = pages[e].GetCksums();
+          char                  *buffer = reinterpret_cast<char*>( pages[e].GetBuffer() );
+
+          uint32_t pgsize = XrdSys::PageSize - pgoff % XrdSys::PageSize;
+          if( pgsize > left ) pgsize = left;
+
+          for( size_t p = 0; p < cksums.size() && left > 0; ++p )
+          {
+            if( XrdOucCRC::Calc32C( buffer, pgsize ) != cksums[p] )
+            {
+              log->Info( FileMsg, "[%p@%s] Received corrupted page, will retry "
+                         "page #%zu of extent #%zu.", (void*)this,
+                         stateHandler->pFileUrl->GetObfuscatedURL().c_str(), p, e );
+
+              retries.emplace_back( e, p );
+              XRootDStatus rst = XrdCl::FileStateHandler::PgReadRetry(
+                                    stateHandler, pgoff, pgsize,
+                                    retries.size()-1, buffer, this, 0 );
+              if( !rst.IsOK() )
+              {
+                retries.pop_back();
+                *status = rst;  // the reason for this failure
+                left = 0;       // stop looking
+                e = pages.size() - 1;
+                break;
+              }
+              ++retrycnt;
+            }
+
+            left   -= pgsize;
+            buffer += pgsize;
+            pgoff  += pgsize;
+            pgsize  = XrdSys::PageSize;
+            if( pgsize > left ) pgsize = left;
+          }
+        }
+
+        //----------------------------------------------------------------------
+        // Either we are done or we have to wait for the retries
+        //----------------------------------------------------------------------
+        resp.reset( response );
+        hosts.reset( hostList );
+        st.reset( status );
+
+        if( retrycnt == 0 ) Finish( lck );
+      }
+
+      //------------------------------------------------------------------------
+      // PgRetryTarget
+      //------------------------------------------------------------------------
+      void UpdateCksum( size_t index, uint32_t crcval )
+      {
+        std::lock_guard<std::mutex> lck( mtx );
+
+        if( !resp || index >= retries.size() ) return;
+
+        size_t e = retries[index].first, p = retries[index].second;
+        XrdCl::VectorPgReadInfo *vinf = 0;
+        resp->Get( vinf );
+        if( !vinf || e >= vinf->GetPages().size() ) return;
+
+        std::vector<uint32_t> &cksums = vinf->GetPages()[e].GetCksums();
+        if( p < cksums.size() ) cksums[p] = crcval;
+        ++repairs[e];
+      }
+
+      void RetryResponse( XrdCl::XRootDStatus *status,
+                          XrdCl::AnyObject    *response,
+                          XrdCl::HostList     *hostList )
+      {
+        HandleResponseWithHosts( status, response, hostList );
+      }
+
+      std::string RetryUrl() const
+      {
+        return stateHandler->pFileUrl->GetObfuscatedURL();
+      }
+
+    private:
+
+      //------------------------------------------------------------------------
+      // Report to the user and commit suicide. Called with the lock held.
+      //------------------------------------------------------------------------
+      void Finish( std::unique_lock<std::mutex> &lck )
+      {
+        using namespace XrdCl;
+
+        VectorPgReadInfo *vinf = 0;
+        if( st->IsOK() && resp ) resp->Get( vinf );
+
+        if( vinf )
+        {
+          std::vector<PageInfo> &pages = vinf->GetPages();
+          for( size_t e = 0; e < pages.size() && e < repairs.size(); ++e )
+            pages[e].SetNbRepair( repairs[e] );
+          userHandler->HandleResponseWithHosts( st.release(), resp.release(),
+                                                hosts.release() );
+        }
+        else
+          userHandler->HandleResponseWithHosts( st.release(), 0, 0 );
+
+        lck.unlock();
+        delete this;
+      }
+
+      std::shared_ptr<XrdCl::FileStateHandler>  stateHandler;
+      XrdCl::ResponseHandler                   *userHandler;
+
+      std::unique_ptr<XrdCl::AnyObject>    resp;
+      std::unique_ptr<XrdCl::HostList>     hosts;
+      std::unique_ptr<XrdCl::XRootDStatus> st;
+
+      std::mutex mtx;
+      bool       maincall;
+      size_t     retrycnt;
+
+      std::vector<std::pair<size_t, size_t>> retries;  //< (extent, page) retried
+      std::vector<size_t>                    repairs;  //< repairs per extent
   };
 
   //----------------------------------------------------------------------------
@@ -1225,7 +1645,7 @@ namespace XrdCl
                                               uint32_t                           size,
                                               size_t                             pgnb,
                                               void                              *buffer,
-                                              PgReadHandler                     *handler,
+                                              PgRetryTarget                     *handler,
                                               time_t                             timeout )
   {
     if( size > (uint32_t)XrdSys::PageSize )
@@ -1290,6 +1710,212 @@ namespace XrdCl
     StatefulHandler *stHandler = new StatefulHandler( self, handler, msg, params );
 
     return SendOrQueue( self, *self->pDataServer, msg, stHandler, params );
+  }
+
+  //----------------------------------------------------------------------------
+  // Read scattered data chunks, with a crc32c per 4KB page
+  //----------------------------------------------------------------------------
+  XRootDStatus FileStateHandler::PgReadV( std::shared_ptr<FileStateHandler> &self,
+                                          const ChunkList                   &chunks,
+                                          ResponseHandler                   *handler,
+                                          time_t                             timeout )
+  {
+    if( chunks.empty() )
+      return XRootDStatus( stError, errInvalidArgs, EINVAL,
+                           "PgReadV requires at least one chunk." );
+
+    //--------------------------------------------------------------------------
+    // Fall back to a pgRead per extent if the server cannot do this in one
+    // request, or if there are more extents than one request can carry. Both
+    // give the caller the same answer, only in more round trips.
+    //--------------------------------------------------------------------------
+    if( !PgReadVSupported( self ) )
+    {
+      DefaultEnv::GetLog()->Debug( FileMsg, "[%p@%s] PgReadV not supported; "
+                                   "substituting with a pgRead per extent.",
+                                   (void*)self.get(),
+                                   self->pFileUrl->GetObfuscatedURL().c_str() );
+      return PgReadVSubst( self, chunks, handler, timeout );
+    }
+
+    if( chunks.size() > size_t( XrdProto::maxRvecsz ) )
+    {
+      DefaultEnv::GetLog()->Debug( FileMsg, "[%p@%s] PgReadV of %zu extents "
+                                   "exceeds the %d the request can carry; "
+                                   "substituting with a pgRead per extent.",
+                                   (void*)self.get(),
+                                   self->pFileUrl->GetObfuscatedURL().c_str(),
+                                   chunks.size(), XrdProto::maxRvecsz );
+      return PgReadVSubst( self, chunks, handler, timeout );
+    }
+
+    //--------------------------------------------------------------------------
+    // The wire path needs the checksums verified here; the fallback does not,
+    // since each of its PgReads is verified by its own PgReadHandler.
+    //--------------------------------------------------------------------------
+    ResponseHandler *pgvHandler = new PgReadVHandler( self, handler );
+    auto st = PgReadVImpl( self, chunks, PgReadFlags::None, pgvHandler, timeout );
+    if( !st.IsOK() ) delete pgvHandler;
+    return st;
+  }
+
+  //----------------------------------------------------------------------------
+  // Can the data server do a vector pgRead in one request?
+  //----------------------------------------------------------------------------
+  bool FileStateHandler::PgReadVSupported( std::shared_ptr<FileStateHandler> &self )
+  {
+    AnyObject obj;
+    XRootDStatus st1 = DefaultEnv::GetPostMaster()->QueryTransport(
+                          *self->pDataServer, XRootDQuery::ServerFlags, obj );
+    int protver = 0;
+    XRootDStatus st2 = Utils::GetProtocolVersion( *self->pDataServer, protver );
+
+    if( !st1.IsOK() || !st2.IsOK() ) return false;
+
+    int *ptr = 0;
+    obj.Get( ptr );
+    bool ok = ( ptr && ( *ptr & kXR_suppgrw ) ) &&
+              ( protver >= kXR_PROTPGRVVERSION );
+    delete ptr;
+
+    return ok;
+  }
+
+  //----------------------------------------------------------------------------
+  // Read scattered data chunks, with a crc32c per 4KB page (actual
+  // implementation): one kXR_pgreadv on the wire.
+  //----------------------------------------------------------------------------
+  XRootDStatus FileStateHandler::PgReadVImpl( std::shared_ptr<FileStateHandler> &self,
+                                              const ChunkList                   &chunks,
+                                              uint16_t                           flags,
+                                              ResponseHandler                   *handler,
+                                              time_t                             timeout )
+  {
+    XrdSysMutexHelper scopedLock( self->pMutex );
+
+    if( self->pFileState == Error ) return self->pStatus;
+
+    if( self->pFileState != Opened && self->pFileState != Recovering )
+      return XRootDStatus( stError, errInvalidOp );
+
+    //--------------------------------------------------------------------------
+    // Retry addresses a single page, it never reaches the vector entry point
+    //--------------------------------------------------------------------------
+    if( flags & PgReadFlags::Retry )
+      return XRootDStatus( stError, errInvalidArgs, EINVAL,
+                           "PgReadV does not support the retry flag." );
+
+    //--------------------------------------------------------------------------
+    // The vector has to fit in one request
+    //--------------------------------------------------------------------------
+    if( chunks.size() > size_t( XrdProto::maxRvecsz ) )
+      return XRootDStatus( stError, errInvalidArgs, EINVAL,
+                           "PgReadV vector is too long." );
+
+    Log *log = DefaultEnv::GetLog();
+    log->Debug( FileMsg, "[%p@%s] Sending a pgreadv command of %zu chunks for "
+                "handle %#x to %s",
+                (void*)self.get(), self->pFileUrl->GetObfuscatedURL().c_str(),
+                chunks.size(), *((uint32_t*)self->pFileHandle),
+                self->pDataServer->GetHostId().c_str() );
+
+    //--------------------------------------------------------------------------
+    // Build the message
+    //--------------------------------------------------------------------------
+    const size_t rlSize = sizeof( XrdProto::read_list );
+
+    Message              *msg;
+    ClientPgReadVRequest *req;
+    MessageUtils::CreateRequest( msg, req, rlSize*chunks.size() );
+
+    req->requestid = kXR_pgreadv;
+    req->reqflags  = static_cast<kXR_char>( flags );
+    req->pathid    = 0;
+    req->dlen      = rlSize*chunks.size();
+
+    ChunkList *list = new ChunkList();
+    list->reserve( chunks.size() );
+
+    XrdProto::read_list *rdList = (XrdProto::read_list*)
+                                  msg->GetBuffer( sizeof( ClientPgReadVRequest ) );
+    for( size_t i = 0; i < chunks.size(); ++i )
+    {
+      rdList[i].rlen   = chunks[i].length;
+      rdList[i].offset = chunks[i].offset;
+      memcpy( rdList[i].fhandle, self->pFileHandle, 4 );
+
+      list->push_back( ChunkInfo( chunks[i].offset,
+                                  chunks[i].length,
+                                  chunks[i].buffer ) );
+    }
+
+    //--------------------------------------------------------------------------
+    // Send the message
+    //--------------------------------------------------------------------------
+    XRootDTransport::SetDescription( msg );
+    MessageSendParams params;
+    params.timeout         = timeout;
+    params.followRedirects = false;
+    params.stateful        = true;
+    params.chunkList       = list;
+    MessageUtils::ProcessSendParams( params );
+    StatefulHandler *stHandler = new StatefulHandler( self, handler, msg, params );
+
+    return SendOrQueue( self, *self->pDataServer, msg, stHandler, params );
+  }
+
+  //----------------------------------------------------------------------------
+  // Read scattered data chunks as a loop of PgReads.
+  //
+  // This is the fallback for servers that do not know kXR_pgreadv. Since
+  // PgRead itself substitutes a plain Read where pgread is unsupported, it is
+  // two levels deep and still returns correct checksums.
+  //----------------------------------------------------------------------------
+  XRootDStatus FileStateHandler::PgReadVSubst( std::shared_ptr<FileStateHandler> &self,
+                                               const ChunkList                   &chunks,
+                                               ResponseHandler                   *handler,
+                                               time_t                             timeout )
+  {
+    //--------------------------------------------------------------------------
+    // Sanity check. PgRead re-checks under the lock, this is only so an
+    // unusable file reports before any handler has been created.
+    //--------------------------------------------------------------------------
+    {
+      XrdSysMutexHelper scopedLock( self->pMutex );
+
+      if( self->pFileState == Error ) return self->pStatus;
+
+      if( self->pFileState != Opened && self->pFileState != Recovering )
+        return XRootDStatus( stError, errInvalidOp );
+
+      Log *log = DefaultEnv::GetLog();
+      log->Debug( FileMsg, "[%p@%s] Sending %zu pgread commands for handle %#x to %s",
+                  (void*)self.get(), self->pFileUrl->GetObfuscatedURL().c_str(),
+                  chunks.size(), *((uint32_t*)self->pFileHandle),
+                  self->pDataServer->GetHostId().c_str() );
+    }
+
+    //--------------------------------------------------------------------------
+    // From here on the handler is ours: every extent reports through the
+    // aggregate, including the ones that fail to be issued, so this must
+    // return OK even then -- an error return would tell the caller that the
+    // handler was never engaged.
+    //--------------------------------------------------------------------------
+    PgReadVSubstHandler *pgvHandler =
+      new PgReadVSubstHandler( handler, chunks.size() );
+
+    for( size_t i = 0; i < chunks.size(); ++i )
+    {
+      ResponseHandler *element = pgvHandler->ElementHandler( i );
+      XRootDStatus st = PgRead( self, chunks[i].offset, chunks[i].length,
+                                chunks[i].buffer, element, timeout );
+      if( !st.IsOK() )
+        element->HandleResponseWithHosts( new XRootDStatus( st ), 0, 0 );
+    }
+
+    pgvHandler->IssueDone();
+
+    return XRootDStatus();
   }
 
   //----------------------------------------------------------------------------
