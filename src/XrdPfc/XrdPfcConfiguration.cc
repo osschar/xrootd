@@ -50,6 +50,7 @@ Configuration::Configuration() :
    m_dirStatsInterval(900),
    m_dirStatsStoreDepth(1),
    m_bufferSize(128*1024),
+   m_iosize(64*1024),
    m_RamAbsAvailable(0),
    m_RamKeepStdBlocks(0),
    m_wqueue_blocks(16),
@@ -735,6 +736,7 @@ bool Cache::Config(const char *config_filename, const char *parameters, XrdOucEn
       cfg_printf("Config effective %s pfc configuration:\n"
                  "       pfc.cschk %s uvkeep %s\n"
                  "       pfc.blocksize %lldk\n"
+                 "       pfc.iosize %lldk\n"
                  "       pfc.prefetch %d\n"
                  "       pfc.urlcgi blocksize %s prefetch %s\n"
                  "       pfc.ram %.fg\n"
@@ -750,6 +752,7 @@ bool Cache::Config(const char *config_filename, const char *parameters, XrdOucEn
                  config_filename,
                  csc[int(m_configuration.m_cs_Chk)], uvk,
                  m_configuration.m_bufferSize >> 10,
+                 m_configuration.m_iosize >> 10,
                  m_configuration.m_prefetch_max_blocks,
                  urlcgi_blks, urlcgi_npref,
                  ram_gb,
@@ -1041,6 +1044,16 @@ bool Cache::ConfigParameters(std::string part, XrdOucStream& config, TmpConfigur
    {
       if ( ! blocksize_str2value("Config", cwg.GetWord(), CFG.m_bufferSize,
                                  CFG.s_min_bufferSize, CFG.s_max_bufferSize))
+         return false;
+   }
+   else if ( part == "iosize" )
+   {
+      // Target size of a single remote request and disk write. Consecutive
+      // blocks are grouped into a BlockRun up to this size, so that a small
+      // pfc.blocksize keeps cinfo granularity fine without making every
+      // transfer tiny.
+      if ( ! blocksize_str2value("Config", cwg.GetWord(), CFG.m_iosize,
+                                 CFG.s_min_iosize, CFG.s_max_iosize))
          return false;
    }
    else if ( part == "prefetch" || part == "nramprefetch" )

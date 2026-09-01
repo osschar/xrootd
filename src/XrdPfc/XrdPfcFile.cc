@@ -73,6 +73,7 @@ File::File(const std::string& path, long long iOffset, long long iFileSize) :
    m_state_cond(0),
    m_block_size(0),
    m_num_blocks(0),
+   m_max_run_blocks(1),
    m_resmon_token(-1),
    m_prefetch_state(kOff),
    m_prefetch_bytes(0),
@@ -593,6 +594,9 @@ bool File::Open(XrdOucCacheIO *inputIO)
    m_state_cond.Lock();
    m_block_size = m_cfi.GetBufferSize();
    m_num_blocks = m_cfi.GetNBlocks();
+   // A BlockRun is one remote request and one disk write. Grow runs up to the
+   // configured target IO size; at or above it every run is a single block.
+   m_max_run_blocks = (int) std::max(1ll, conf.m_iosize / m_block_size);
    m_prefetch_state = (m_cfi.IsComplete()) ? kComplete : kStopped; // Will engage in AddIO().
    m_prefetch_max_blocks_in_flight = pfc_prefetch;
    if (pfc_prefetch != conf.m_prefetch_max_blocks)
@@ -1024,6 +1028,12 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
 
    std::unordered_map<Block*, std::vector<ChunkRequest>> blks_ready;
 
+   // Blocks that are neither in RAM nor on disk, keyed by block index. Sorted
+   // order is what run grouping needs, and the map folds together the several
+   // chunks of one readV that can land in the same block.
+   struct PendingChunk { char *m_buf; long long m_blk_off; int m_size; };
+   std::map<int, std::vector<PendingChunk>> to_fetch;
+
    std::vector<XrdOucIOVec> iovec_disk;
    std::vector<XrdOucIOVec> iovec_direct;
    int                      iovec_disk_total = 0;
@@ -1041,7 +1051,7 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
 
       TRACEF(DumpXL, tpfx << "sid: " << Xrd::hex1 << rh->m_seq_id << " idx_first: " << idx_first << " idx_last: " << idx_last);
 
-      enum LastBlock_e { LB_other, LB_disk, LB_direct };
+      enum LastBlock_e { LB_other, LB_disk };
 
       LastBlock_e lbe = LB_other;
 
@@ -1104,56 +1114,119 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
 
             lbe = LB_disk;
          }
-         // Neither ... then we have to go get it ...
+         // Neither ... then we have to go get it. Record it and decide on run
+         // grouping once the whole request has been classified -- a run needs
+         // its length up front, as it is one RAM allocation.
          else
          {
             if ( ! read_req)
                read_req = new ReadRequest(io, rh);
 
-            // Is there room for one more RAM Block?
-            BlockRun *run = PrepareBlockRun(block_idx, 1, io, read_req, false);
-            if (run)
-            {
-               Block *b = run->m_blocks.front();
+            to_fetch[block_idx].push_back( { iUserBuff + off, blk_off, size } );
 
-               TRACEF(Dump, tpfx << "inc_ref_count new " <<  (void*)iUserBuff << " idx = " << block_idx);
-               inc_ref_count(b);
-               runs_to_request.push_back(run);
-
-               b->m_chunk_reqs.emplace_back(ChunkRequest(read_req, iUserBuff + off, blk_off, size));
-               ++read_req->m_n_chunk_reqs;
-
-               lbe = LB_other;
-            }
-            else // Nope ... read this directly without caching.
-            {
-               TRACEF(DumpXL, tpfx << "direct block " << block_idx << ", blk_off " << blk_off << ", size " << size);
-
-               iovec_direct_total += size;
-               read_req->m_direct_done = false;
-
-               // Make sure we do not issue a ReadV with chunk size above XrdProto::maxRVdsz.
-               // Number of actual ReadVs issued so as to not exceed the XrdProto::maxRvecsz limit
-               // is determined in the RequestBlocksDirect().
-               if (lbe == LB_direct && iovec_direct.back().size + size <= XrdProto::maxRVdsz) {
-                  iovec_direct.back().size += size;
-               } else {
-                  long long  in_offset = block_idx * m_block_size + blk_off;
-                  char      *out_pos   = iUserBuff + off;
-                  while (size > XrdProto::maxRVdsz) {
-                     iovec_direct.push_back( { in_offset, XrdProto::maxRVdsz, 0, out_pos } );
-                     in_offset += XrdProto::maxRVdsz;
-                     out_pos   += XrdProto::maxRVdsz;
-                     size      -= XrdProto::maxRVdsz;
-                  }
-                  iovec_direct.push_back( { in_offset, size, 0, out_pos } );
-               }
-
-               lbe = LB_direct;
-            }
+            lbe = LB_other;
          }
       } // end for over blocks in an IOVec
    } // end for over readV IOVec
+
+   // Group the blocks we have to fetch into runs of consecutive indices, one
+   // remote request and one disk write each. Runs are capped at
+   // m_max_run_blocks; when the block size is at or above the target IO size
+   // that cap is one block and every run holds exactly one.
+   for (auto it = to_fetch.begin(); it != to_fetch.end(); )
+   {
+      const int first = it->first;
+
+      int  n  = 1;
+      auto jt = std::next(it);
+      while (jt != to_fetch.end() && jt->first == first + n && n < m_max_run_blocks)
+      {
+         ++n; ++jt;
+      }
+
+      BlockRun *run = PrepareBlockRun(first, n, io, read_req, false);
+
+      // Out of RAM for a whole run -- a single block may still fit.
+      if ( ! run && n > 1)
+      {
+         n   = 1;
+         jt  = std::next(it);
+         run = PrepareBlockRun(first, 1, io, read_req, false);
+      }
+
+      if (run)
+      {
+         const int n_got = run->get_n_blocks();
+
+         for (int k = 0; k < n_got; ++k)
+         {
+            Block *b = run->m_blocks[k];
+            for (const PendingChunk &pc : to_fetch[first + k])
+            {
+               TRACEF(Dump, tpfx << "inc_ref_count new " << (void*)pc.m_buf << " idx = " << (first + k));
+               inc_ref_count(b);
+               b->m_chunk_reqs.emplace_back(ChunkRequest(read_req, pc.m_buf, pc.m_blk_off, pc.m_size));
+               ++read_req->m_n_chunk_reqs;
+            }
+         }
+
+         TRACEF(DumpXL, tpfx << "new run idx " << first << " n_blocks " << n_got);
+
+         runs_to_request.push_back(run);
+
+         it = to_fetch.lower_bound(first + n_got);
+      }
+      else
+      {
+         // Nope ... read these directly without caching.
+         for (auto kt = it; kt != jt; ++kt)
+         {
+            for (const PendingChunk &pc : kt->second)
+            {
+               TRACEF(DumpXL, tpfx << "direct block " << kt->first << ", blk_off " << pc.m_blk_off <<
+                      ", size " << pc.m_size);
+
+               read_req->m_direct_done = false;
+               iovec_direct_total += pc.m_size;
+
+               long long in_offset = (long long) kt->first * m_block_size + pc.m_blk_off;
+               char     *out_pos   = pc.m_buf;
+               int       size      = pc.m_size;
+
+               // Coalesce only when both the file extent and the destination
+               // buffer continue where the previous entry ended -- chunks of a
+               // readV are adjacent in the file far more often than in the
+               // caller's buffers.
+               if ( ! iovec_direct.empty())
+               {
+                  XrdOucIOVec &bk = iovec_direct.back();
+                  if (bk.offset + bk.size == in_offset &&
+                      bk.data   + bk.size == out_pos   &&
+                      bk.size   + size    <= XrdProto::maxRVdsz)
+                  {
+                     bk.size += size;
+                     continue;
+                  }
+               }
+
+               // Make sure we do not issue a ReadV with a chunk size above
+               // XrdProto::maxRVdsz. The number of actual ReadVs issued so as to
+               // not exceed the XrdProto::maxRvecsz limit is determined in
+               // RequestBlocksDirect().
+               while (size > XrdProto::maxRVdsz)
+               {
+                  iovec_direct.push_back( { in_offset, XrdProto::maxRVdsz, 0, out_pos } );
+                  in_offset += XrdProto::maxRVdsz;
+                  out_pos   += XrdProto::maxRVdsz;
+                  size      -= XrdProto::maxRVdsz;
+               }
+               iovec_direct.push_back( { in_offset, size, 0, out_pos } );
+            }
+         }
+
+         it = jt;
+      }
+   }
 
    inc_prefetch_hit_cnt(prefetch_cnt);
 

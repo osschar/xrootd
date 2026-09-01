@@ -452,6 +452,7 @@ private:
    XrdSysCondVar m_state_cond;
    long long     m_block_size;
    int           m_num_blocks;
+   int           m_max_run_blocks;     //!< max blocks per BlockRun, from pfc.iosize
 
    // Stats and ResourceMonitor interface
 

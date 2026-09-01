@@ -111,6 +111,7 @@ struct Configuration
    int       m_dirStatsStoreDepth;      //!< maximum depth for statistics write out
 
    long long m_bufferSize;              //!< cache block size, default 128 kB
+   long long m_iosize;                  //!< target size of a remote request / disk write, default 64 kB
    long long m_RamAbsAvailable;         //!< available from configuration
    int       m_RamKeepStdBlocks;        //!< number of standard-sized blocks kept after release
    int       m_wqueue_blocks;           //!< maximum number of blocks written per write-queue loop
@@ -136,6 +137,9 @@ struct Configuration
 
    static constexpr long long s_min_bufferSize = 4 * 1024;
    static constexpr long long s_max_bufferSize = 512 * 1024 * 1024;
+
+   static constexpr long long s_min_iosize = 4 * 1024;
+   static constexpr long long s_max_iosize = 512 * 1024 * 1024;
 
    static constexpr int s_max_prefetch_max_blocks = 4096;
 
