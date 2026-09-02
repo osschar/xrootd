@@ -835,6 +835,8 @@ void File::ProcessRunRequest(BlockRun *run)
       TRACEF(Dump, "ProcessRunRequest() " << buf);
    }
 
+   if constexpr (kTraceNetTime) brh->m_t_issue = pfc_now_ns();
+
    if (run->req_cksum_net())
    {
       run->get_io()->GetInput()->pgRead(*brh, run->get_buff(), run->get_offset(), run->get_alloc_size(),
@@ -890,6 +892,8 @@ void File::ProcessRunRequests(BlockRunList_t& runs, IO *io)
              ", total_size = " << expected);
 
       auto *bsh = new BlockSequenceResponseHandler(this, std::move(batch), expected);
+
+      if constexpr (kTraceNetTime) bsh->m_t_issue = pfc_now_ns();
 
       io->GetInput()->ReadV(*bsh, iov.data(), n);
 
@@ -1208,6 +1212,7 @@ int File::ReadOpusCoalescere(IO *io, const XrdOucIOVec *readV, int readVnum,
                inc_ref_count(b);
                b->m_chunk_reqs.emplace_back(ChunkRequest(read_req, pc.m_buf, pc.m_blk_off, pc.m_size));
                ++read_req->m_n_chunk_reqs;
+               if constexpr (kTraceNetTime) ++read_req->m_n_remote;
             }
          }
 
@@ -1734,6 +1739,17 @@ void File::FinalizeReadRequest(ReadRequest *rreq)
       check_delta_stats();
    }
 
+   if constexpr (kTraceNetTime) if (XRD_TRACE What >= TRACE_Info)
+   {
+      const long long t_done = pfc_now_ns();
+      char buf[192];
+      snprintf(buf, sizeof(buf),
+               "CLIREAD start=%lld.%09lld dt_us=%lld bytes=%lld n_remote=%d",
+               rreq->m_t_start / 1000000000LL, rreq->m_t_start % 1000000000LL,
+               (t_done - rreq->m_t_start) / 1000, rreq->m_bytes_read, rreq->m_n_remote);
+      TRACEF(Info, buf);
+   }
+
    rreq->m_rh->Done(rreq->return_value());
    delete rreq;
 }
@@ -2095,8 +2111,38 @@ std::string File::GetRemoteLocations() const
 //=======================    RESPONSE HANDLERS    ==============================
 //==============================================================================
 
+void File::TraceNetTime(const char *what, long long t_issue, int n_elem, long long n_bytes, int res)
+{
+   // One line per *network* request, emitted from the completion callback before
+   // any processing, so dt is issue-to-callback as seen inside this process.
+   //
+   // issue/done are CLOCK_REALTIME, the same clock tcpdump stamps frames with,
+   // so these lines can be joined against a capture to split the interval into
+   // time on the wire and time queued inside XrdCl.
+
+   if constexpr (!kTraceNetTime) return;
+
+   if (XRD_TRACE What < TRACE_Info) return;
+
+   const long long t_done = pfc_now_ns();
+   char buf[256];
+   snprintf(buf, sizeof(buf),
+            "NETTIME %s issue=%lld.%09lld done=%lld.%09lld dt_us=%lld n_elem=%d bytes=%lld res=%d",
+            what,
+            t_issue / 1000000000LL, t_issue % 1000000000LL,
+            t_done  / 1000000000LL, t_done  % 1000000000LL,
+            (t_done - t_issue) / 1000, n_elem, n_bytes, res);
+   TRACEF(Info, buf);
+}
+
+//------------------------------------------------------------------------------
+
 void BlockRunResponseHandler::Done(int res)
 {
+   if constexpr (kTraceNetTime)
+      m_run->m_file->TraceNetTime(m_run->req_cksum_net() ? "pgread" : "read",
+                                  m_t_issue, 1, m_run->get_data_size(), res);
+
    m_run->m_file->ProcessRunResponse(m_run, res);
    delete this;
 }
@@ -2105,6 +2151,9 @@ void BlockRunResponseHandler::Done(int res)
 
 void BlockSequenceResponseHandler::Done(int res)
 {
+   if constexpr (kTraceNetTime)
+      m_file->TraceNetTime("readv", m_t_issue, (int) m_runs.size(), m_expected_size, res);
+
    m_file->ProcessSequenceResponse(this, res);
    delete this;
 }

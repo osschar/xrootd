@@ -25,11 +25,33 @@
 #include "XrdOuc/XrdOucCache.hh"
 #include "XrdOuc/XrdOucIOVec.hh"
 
+#include <ctime>
 #include <functional>
 #include <list>
 #include <map>
 #include <set>
 #include <string>
+
+//! Compile-time switch for the NETTIME / CLIREAD wall-clock traces.
+//!
+//! When on, one line is emitted per remote request (NETTIME) and per
+//! client-facing read (CLIREAD) at `pfc.trace info`, stamped with
+//! CLOCK_REALTIME so the lines can be joined against a tcpdump capture.
+//! That pair is what identified kXR_readv being serialised per link -- see
+//! claude-xrootd-wan-readv-latency.md.
+//!
+//! Cost when on is two clock_gettime calls per request plus a snprintf;
+//! when off the compiler removes every trace of it.
+inline constexpr bool kTraceNetTime = false;
+
+//! Wall-clock nanoseconds, on the same clock as tcpdump/tshark frame times, so
+//! that NETTIME trace lines can be aligned with a packet capture.
+inline long long pfc_now_ns()
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_REALTIME, &ts);
+   return (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 
 class XrdJob;
 struct XrdOucIOVec;
@@ -77,8 +99,11 @@ struct ReadRequest
    bool        m_sync_done    = false;
    bool        m_direct_done  = true;
 
+   long long   m_t_start      = 0;   //!< wall-clock ns at entry to ReadOpusCoalescere
+   int         m_n_remote     = 0;   //!< chunk reqs that had to wait for a remote fetch
+
    ReadRequest(IO *io, ReadReqRH *rh) :
-      m_io(io), m_rh(rh)
+      m_io(io), m_rh(rh), m_t_start(kTraceNetTime ? pfc_now_ns() : 0)
    {}
 
    void update_error_cond(int ec) { ++m_error_count; if (m_error_cond == 0 ) m_error_cond = ec; }
@@ -256,6 +281,7 @@ class BlockRunResponseHandler : public XrdOucCacheIOCB
 {
 public:
    BlockRun *m_run;
+   long long m_t_issue = 0;   //!< wall-clock ns just before the request goes to XrdCl
 
    BlockRunResponseHandler(BlockRun *r) : m_run(r) {}
 
@@ -275,6 +301,7 @@ public:
    File           *m_file;
    BlockRunList_t  m_runs;
    int             m_expected_size;
+   long long       m_t_issue = 0;   //!< wall-clock ns just before the ReadV goes to XrdCl
 
    BlockSequenceResponseHandler(File *f, BlockRunList_t runs, int expected_size) :
       m_file(f), m_runs(std::move(runs)), m_expected_size(expected_size)
@@ -519,6 +546,8 @@ private:
 
    void ProcessRunResponse(BlockRun *run, int res);
    void ProcessSequenceResponse(BlockSequenceResponseHandler *h, int res);
+
+   void TraceNetTime(const char *what, long long t_issue, int n_elem, long long n_bytes, int res);
 
    // Block management
 
