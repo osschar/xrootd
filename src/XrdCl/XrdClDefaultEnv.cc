@@ -273,6 +273,7 @@ namespace XrdCl
     REGISTER_VAR_INT( varsInt, "RunForkHandler",          DefaultRunForkHandler          );
     REGISTER_VAR_INT( varsInt, "RedirectLimit",           DefaultRedirectLimit           );
     REGISTER_VAR_INT( varsInt, "WorkerThreads",           DefaultWorkerThreads           );
+    REGISTER_VAR_INT( varsInt, "ChannelsPerHost",        DefaultChannelsPerHost         );
     REGISTER_VAR_INT( varsInt, "CPChunkSize",             DefaultCPChunkSize             );
     REGISTER_VAR_INT( varsInt, "CPParallelChunks",        DefaultCPParallelChunks        );
     REGISTER_VAR_INT( varsInt, "DataServerTTL",           DefaultDataServerTTL           );

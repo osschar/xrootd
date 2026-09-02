@@ -24,6 +24,7 @@
 #include "XrdOuc/XrdOucPrivateUtils.hh"
 #include <algorithm>
 #include <cctype>
+#include <atomic>
 #include <cstdlib>
 #include <sstream>
 #include <vector>
@@ -509,6 +510,28 @@ namespace XrdCl
         ret += itr->second;
         hascgi = true;
       }
+    }
+
+    //--------------------------------------------------------------------------
+    // ChannelsPerHost > 1 spreads opens over that many channels to the same
+    // host.  XRootD serialises kXR_readv per link (do_ReadV ignores the
+    // pathid the protocol reserves for it), so a client holding one channel
+    // gets one vector read in flight no matter how many it issues.  The slot
+    // is per URL instance, not per path, so N opens of one file also spread.
+    //--------------------------------------------------------------------------
+    int chansPerHost = DefaultChannelsPerHost;
+    Env *env = DefaultEnv::GetEnv();
+    if( env ) env->GetInt( "ChannelsPerHost", chansPerHost );
+
+    if( chansPerHost > 1 )
+    {
+      if( pChanSlot < 0 )
+      {
+        static std::atomic<unsigned int> counter{ 0 };
+        pChanSlot = counter++ % (unsigned int) chansPerHost;
+      }
+      ret += '#';
+      ret += std::to_string( pChanSlot );
     }
 
     return ret;

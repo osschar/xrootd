@@ -58,6 +58,7 @@ namespace XrdCl
   const int DefaultRunForkHandler          = 1;
   const int DefaultRedirectLimit           = 16;
   const int DefaultWorkerThreads           = 3;
+  const int DefaultChannelsPerHost         = 1;
   const int DefaultCPChunkSize             = 8388608;
   const int DefaultCPParallelChunks        = 4;
   const int DefaultDataServerTTL           = 300;
@@ -131,6 +132,7 @@ namespace XrdCl
       { to_lower( "RunForkHandler" ),          DefaultRunForkHandler },
       { to_lower( "RedirectLimit" ),           DefaultRedirectLimit },
       { to_lower( "WorkerThreads" ),           DefaultWorkerThreads },
+      { to_lower( "ChannelsPerHost" ),        DefaultChannelsPerHost },
       { to_lower( "CPChunkSize" ),             DefaultCPChunkSize },
       { to_lower( "CPParallelChunks" ),        DefaultCPParallelChunks },
       { to_lower( "DataServerTTL" ),           DefaultDataServerTTL },

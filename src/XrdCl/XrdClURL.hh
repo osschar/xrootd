@@ -311,6 +311,9 @@ namespace XrdCl
       std::string pPath;
       ParamsMap   pParams;
       std::string pURL;
+      //! Channel slot, assigned lazily from ChannelsPerHost so that separate
+      //! opens of the same path can land on separate channels.
+      mutable int pChanSlot = -1;
 
   };
 }
