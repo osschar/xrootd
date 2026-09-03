@@ -66,6 +66,8 @@
 #include "XrdOuc/XrdOucExport.hh"
 #include "XrdOuc/XrdOucPgrwUtils.hh"
 #include "XrdOuc/XrdOucPrivateUtils.hh"
+#include <atomic>
+
 #include "XrdSec/XrdSecEntity.hh"
 #include "XrdSecsss/XrdSecsssID.hh"
 #include "XrdSfs/XrdSfsInterface.hh"
@@ -890,6 +892,50 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
 // Record the security environment
 //
    entity = Env.secEnv();
+
+// TEST: self-redirect to spread opens over separate XrdCl channels.
+//
+// XrdCl keys channels on (user, host, port), and the server serialises
+// kXR_readv per link, so a client reading N files through one endpoint gets
+// one outstanding vector read. Handing each open back a distinct synthetic
+// username puts it on its own channel. This is the early-open hook Andy
+// suggested: the redirect is raised here, in the pss layer, before any work
+// is done, and XrdOfs turns -EDESTADDRREQ plus "FileURL" into SFS_REDIRECT.
+//
+// XRD_TEST_SELFREDIR_TARGET=host:port enables it, XRD_TEST_SELFREDIR_USERS=N
+// sets the fan-out. Clients already carrying a synthetic name are served
+// normally, which is what stops the redirect looping.
+   {static const char    *srTgt = getenv("XRD_TEST_SELFREDIR_TARGET");
+    static const char    *srNum = getenv("XRD_TEST_SELFREDIR_USERS");
+    static const unsigned srN   = srNum ? (unsigned)atoi(srNum) : 0;
+    // The marker has to be looked for in tident (the login name, e.g.
+    // "xc3.123:4@host"), not in name: under sec.protocol host there is no
+    // authenticated name, so name is null and the guard never fired.
+    const char *who = entity ? (entity->tident ? entity->tident
+                                               : entity->name) : 0;
+    if (srTgt && srN > 1 && !(who && !strncmp(who, "xc", 2)))
+       {static std::atomic<unsigned> srRR{0};
+        char uBuff[64], *uRL;
+        snprintf(uBuff, sizeof(uBuff), "xc%u", srRR++ % srN);
+        uRL = (char *)malloc(2048);
+        // note the double slash: root://host:port//abs/path, or xrootd
+        // parses it as relative and refuses the open
+        // Vary the HOST, not just the user: XrdCl's RetryAtServer compares
+        // URL::GetLocation(), which omits the username, so a redirect that
+        // differs only in user looks like "same server" and loops on stock
+        // clients. All of 127.0.0.0/8 is loopback, so 127.0.0.N reaches this
+        // same server under a distinct channel key. The synthetic user is
+        // kept purely as the loop marker.
+        // XRD_TEST_SELFREDIR_TARGET is then just the ":port" suffix.
+        snprintf(uRL, 2048, "root://%s@127.0.0.%u%s/%s%s", uBuff,
+                 1 + (srRR - 1) % srN, srTgt,
+                 (*path == '/' ? "" : "/"), path);
+        Env.Put("FileURL", uRL);
+        DEBUG(path, "self-redirect -> " <<uRL);
+        free(uRL);
+        return -EDESTADDRREQ;
+       }
+   }
 
 // Turn off direct flag if set (we record it separately
 //

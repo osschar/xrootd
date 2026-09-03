@@ -2161,7 +2161,14 @@ namespace XrdCl
     if( pRdirEntry ) pRedirectTraceBack.push_back( std::move( pRdirEntry ) );
     pRdirEntry.reset( new RedirectEntry( pUrl.GetLocation(), url.GetLocation(), entryType ) );
 
-    if( pUrl.GetLocation() != url.GetLocation() )
+    // GetLocation() is protocol://host:port/path and deliberately omits the
+    // user, but the channel key (GetChannelId) includes it. A redirect that
+    // differs only in username -- which is how a server can ask a client to
+    // open a second channel to the same endpoint -- therefore looked like
+    // "same server" here, so the request was retried on the old channel and
+    // the server redirected again, to the redirect limit. Compare the channel.
+    if( pUrl.GetLocation()  != url.GetLocation() ||
+        pUrl.GetChannelId() != url.GetChannelId() )
     {
       pHosts->push_back( url );
 
