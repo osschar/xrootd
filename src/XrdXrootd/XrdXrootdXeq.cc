@@ -78,6 +78,8 @@
 
 #include "XrdCrypto/XrdCryptoLite_BFecb.hh"
 
+#include <atomic>
+
 #include "XrdVersion.hh"
 
 #ifndef ENODATA
@@ -1614,10 +1616,24 @@ int XrdXrootdProtocol::do_Open()
        if (Route[RD_openw].Host[rdType] && ('w' == usage || strchr(op, 'd')))
          ropt = RD_openw;
      if (ropt > 0)
-       return Response.Send(
-         kXR_redirect, Route[ropt].Port[rdType],
-         Route[ropt].Host[rdType]
-       );
+       {// TEST HACK, not for upstream. XRD_TEST_REDIR_USERS=N makes the static
+        // open redirect hand back a rotating synthetic username, so each open
+        // lands on its own XrdCl channel (the key is user,host,port). Used to
+        // measure whether a server can split channels by itself. Unset or 1
+        // gives stock behaviour.
+        static const char    *truEnv = getenv("XRD_TEST_REDIR_USERS");
+        static const unsigned truN   = truEnv ? (unsigned)atoi(truEnv) : 0;
+        if (truN > 1)
+           {static std::atomic<unsigned> rrN{0};
+            char rbuf[320];
+            snprintf(rbuf, sizeof(rbuf), "u%u@%s", rrN++ % truN,
+                     Route[ropt].Host[rdType]);
+            return Response.Send(kXR_redirect, Route[ropt].Port[rdType], rbuf);
+           }
+        return Response.Send(
+          kXR_redirect, Route[ropt].Port[rdType],
+          Route[ropt].Host[rdType]
+        );}
    }
 
 // Add the multi-write option if this path supports it
