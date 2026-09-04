@@ -920,15 +920,13 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
         uRL = (char *)malloc(2048);
         // note the double slash: root://host:port//abs/path, or xrootd
         // parses it as relative and refuses the open
-        // Vary the HOST, not just the user: XrdCl's RetryAtServer compares
-        // URL::GetLocation(), which omits the username, so a redirect that
-        // differs only in user looks like "same server" and loops on stock
-        // clients. All of 127.0.0.0/8 is loopback, so 127.0.0.N reaches this
-        // same server under a distinct channel key. The synthetic user is
-        // kept purely as the loop marker.
-        // XRD_TEST_SELFREDIR_TARGET is then just the ":port" suffix.
-        snprintf(uRL, 2048, "root://%s@127.0.0.%u%s/%s%s", uBuff,
-                 1 + (srRR - 1) % srN, srTgt,
+        // Redirect to a SECOND PORT of this same instance (xrd.protocol
+        // xroot:<p> +port), carrying a synthetic username. The port makes
+        // URL::GetLocation() differ, so RetryAtServer takes its new-server
+        // branch on a stock client; the username makes GetChannelId() differ,
+        // so each open gets its own channel. The username also serves as the
+        // loop marker. XRD_TEST_SELFREDIR_TARGET is host:secondport.
+        snprintf(uRL, 2048, "root://%s@%s/%s%s", uBuff, srTgt,
                  (*path == '/' ? "" : "/"), path);
         Env.Put("FileURL", uRL);
         DEBUG(path, "self-redirect -> " <<uRL);
