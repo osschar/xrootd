@@ -908,12 +908,16 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
    {static const char    *srTgt = getenv("XRD_TEST_SELFREDIR_TARGET");
     static const char    *srNum = getenv("XRD_TEST_SELFREDIR_USERS");
     static const unsigned srN   = srNum ? (unsigned)atoi(srNum) : 0;
-    // The marker has to be looked for in tident (the login name, e.g.
-    // "xc3.123:4@host"), not in name: under sec.protocol host there is no
-    // authenticated name, so name is null and the guard never fired.
-    const char *who = entity ? (entity->tident ? entity->tident
-                                               : entity->name) : 0;
-    if (srTgt && srN > 1 && !(who && !strncmp(who, "xc", 2)))
+    // Loop guard: an explicit CGI marker, not the identity.
+    //
+    // The login name from kXR_login is sanitised and handed only to
+    // Link->setID() (XrdXrootdXeq.cc:1100); nothing assigns it to
+    // XrdSecEntity::name, which is set by auth protocols and is null under
+    // sec.protocol host. XrdSecEntity::tident is a *trace* identifier that
+    // merely happens to begin with the login name, so keying on it worked by
+    // accident. XrdOfs builds the open env from the client's opaque info
+    // (XrdOucEnv Open_Env(info, 0, client)), so a CGI marker does reach here.
+    if (srTgt && srN > 1 && !Env.Get("xcredir"))
        {static std::atomic<unsigned> srRR{0};
         char uBuff[64], *uRL;
         snprintf(uBuff, sizeof(uBuff), "xc%u", srRR++ % srN);
@@ -926,7 +930,7 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
         // branch on a stock client; the username makes GetChannelId() differ,
         // so each open gets its own channel. The username also serves as the
         // loop marker. XRD_TEST_SELFREDIR_TARGET is host:secondport.
-        snprintf(uRL, 2048, "root://%s@%s/%s%s", uBuff, srTgt,
+        snprintf(uRL, 2048, "root://%s@%s/%s%s?xcredir=1", uBuff, srTgt,
                  (*path == '/' ? "" : "/"), path);
         Env.Put("FileURL", uRL);
         DEBUG(path, "self-redirect -> " <<uRL);
