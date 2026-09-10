@@ -398,7 +398,7 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
 // path, since both bump linkAioReq). Settable from a config file with
 // 'setenv'.
 //
-   if (char *cP = getenv("XRD_HACK_ASYNC_READV"); cP && *cP)
+   if (char *cP = getenv("HACK_ASYNC_READV"); cP && *cP)
       {as_maxvecs = atoi(cP);
        if (as_maxvecs < 0) as_maxvecs = 0;
        if (as_maxvecs > 0)
@@ -406,7 +406,7 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
                     "%d in flight per link - THIS IS A TEST BUILD",
                     as_maxvecs);
            eDest.Say("Config HACK asynchronous readv enabled: ", buff);
-           if (char *fP = getenv("XRD_HACK_ASYNC_READV_PERFILE"); fP && *fP)
+           if (char *fP = getenv("HACK_ASYNC_READV_PERFILE"); fP && *fP)
               {as_maxvecsf = atoi(fP);
                if (as_maxvecsf < 0) as_maxvecsf = 0;
                if (as_maxvecsf > 0)

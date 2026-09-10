@@ -2755,7 +2755,7 @@ int XrdXrootdProtocol::do_ReadNone(int &retc, int &pathID)
 //
 // It is NOT the fix: it ties up a thread per in-flight request, and it gives
 // the storage layer no way to say whether concurrency is safe for it. Enabled
-// only by XRD_HACK_ASYNC_READV; off by default. See the commit message.
+// only by HACK_ASYNC_READV; off by default. See the commit message.
 
 class XrdXrootdReadVJob : public XrdJob
 {
