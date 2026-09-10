@@ -35,6 +35,7 @@
 
 #include "XProtocol/XPtypes.hh"
 #include "XrdSys/XrdSysPthread.hh"
+#include "XrdSys/XrdSysRAtomic.hh"
 #include "XrdXrootd/XrdXrootdFileStats.hh"
 
 /******************************************************************************/
@@ -120,6 +121,8 @@ XrdXrootdFileHP   *fhProc;       // File handle processor (set at close time)
 const char        *ID;           // File user
 
 XrdXrootdFileStats Stats;        // File access statistics
+
+RAtomic_int        vecReq{0};    // [HACK] async readv in flight on this file
 
 static void Init(XrdXrootdFileLock *lp, XrdSysError *erP, bool sfok);
 

@@ -225,6 +225,8 @@ static const int     maxStreams = 16;
 static int           as_maxperlnk; // Max async requests per link
 static int           as_maxvecs;   // [HACK] Max async readv in flight per
                                    //        link; 0 = feature off
+static int           as_maxvecsf;  // [HACK] ... and per open file; 0 = no
+                                   //        per-file limit
 static int           as_maxperreq; // Max async ops per request
 static int           as_maxpersrv; // Max async ops per server
 static int           as_miniosz;   // Min async request size

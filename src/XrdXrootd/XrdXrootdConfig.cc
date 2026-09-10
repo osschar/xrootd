@@ -406,6 +406,15 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
                     "%d in flight per link - THIS IS A TEST BUILD",
                     as_maxvecs);
            eDest.Say("Config HACK asynchronous readv enabled: ", buff);
+           if (char *fP = getenv("XRD_HACK_ASYNC_READV_PERFILE"); fP && *fP)
+              {as_maxvecsf = atoi(fP);
+               if (as_maxvecsf < 0) as_maxvecsf = 0;
+               if (as_maxvecsf > 0)
+                  {snprintf(buff, sizeof(buff), "%d in flight per open file",
+                            as_maxvecsf);
+                   eDest.Say("Config HACK asynchronous readv limit: ", buff);
+                  }
+              }
           }
       }
 

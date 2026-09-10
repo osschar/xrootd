@@ -119,6 +119,7 @@ int                   XrdXrootdProtocol::maxReadv_ior =
                       XrdXrootdProtocol::maxTransz-(int)sizeof(readahead_list);
 int                   XrdXrootdProtocol::as_maxperlnk = 8;   // Max ops per link
 int                   XrdXrootdProtocol::as_maxvecs   = 0;   // [HACK] off
+int                   XrdXrootdProtocol::as_maxvecsf  = 0;   // [HACK] no limit
 int                   XrdXrootdProtocol::as_maxperreq = 8;   // Max ops per request
 int                   XrdXrootdProtocol::as_maxpersrv = 4096;// Max ops per server
 int                   XrdXrootdProtocol::as_seghalf   = 32768;

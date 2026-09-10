@@ -2763,10 +2763,10 @@ public:
 
          XrdXrootdReadVJob(XrdXrootdProtocol *pP, XrdXrootdFile *fP,
                            XrdLink *lP, XrdBuffer *bP, int qsz,
-                           const XrdOucIOVec *vP, int vN)
+                           const XrdOucIOVec *vP, int vN, bool slot)
                           : XrdJob("async readv"),
                             protP(pP), fileP(fP), linkP(lP), bufP(bP),
-                            rdVec(vP, vP+vN), Quantum(qsz)
+                            rdVec(vP, vP+vN), Quantum(qsz), slotHeld(slot)
                           {Response = pP->Response;}
 
 virtual ~XrdXrootdReadVJob() {}
@@ -2776,6 +2776,7 @@ virtual ~XrdXrootdReadVJob() {}
 private:
 
          void Finish();
+         void ReleaseSlot();
          int  SendError(XrdSfsXferSize xfrSZ);
 
 static const char        *TraceID;
@@ -2787,6 +2788,7 @@ XrdBuffer                *bufP;
 std::vector<XrdOucIOVec>  rdVec;
 XrdXrootdResponse         Response;
 int                       Quantum;
+bool                      slotHeld;
 };
 
 const char *XrdXrootdReadVJob::TraceID = "areadv";
@@ -2839,6 +2841,7 @@ void XrdXrootdReadVJob::DoIt()
        rdVXfr += rdVAmt;
       }
 
+   ReleaseSlot();
    fileP->Stats.rvOps(rdVXfr, rdVecNum);
    TRACE(FSIO, "fh=" <<currFH<<" areadV "<<rdVXfr<<" in "<<rdVecNum<<" segs");
 
@@ -2874,12 +2877,20 @@ int XrdXrootdReadVJob::SendError(XrdSfsXferSize xfrSZ)
 
 /******************************************************************************/
 
+void XrdXrootdReadVJob::ReleaseSlot()
+{
+   if (slotHeld) {slotHeld = false; --(fileP->vecReq);}
+}
+
+/******************************************************************************/
+
 void XrdXrootdReadVJob::Finish()
 {
 // Order matters: the link reference is what keeps the protocol object alive,
 // so drop it last of the three. Mirrors XrdXrootdNormAio::Recycle().
 //
    XrdXrootdProtocol::BPool->Release(bufP);
+   ReleaseSlot();
    fileP->Ref(-1);
    protP->aioUpdReq(-1);
    protP->aioUpdate(-1);
@@ -2907,13 +2918,26 @@ bool XrdXrootdProtocol::do_ReadVAsync(XrdOucIOVec *rdVec, int rdVecNum,
    for (int i = 1; i < rdVecNum; i++)
        if (rdVec[i].info != rdVec[0].info) return false;
 
+// Claim a per-file slot. With a cap of 1 this reproduces the semantics of the
+// client-side workaround -- one channel per file, so a file's vector reads stay
+// serialised while different files overlap -- which is also the granularity
+// upstream said would be sufficient. It additionally removes the race on the
+// XrdSfsFile::error object that SendError() would otherwise have.
+//
+   bool slot = as_maxvecsf > 0;
+   if (slot && ++(IO.File->vecReq) > as_maxvecsf)
+      {--(IO.File->vecReq); return false;}
+
 // The job needs a buffer of its own. argp belongs to the link and is refilled
 // with the next request the moment we return.
 //
-   if (!(bP = BPool->Obtain(Quantum))) return false;
+   if (!(bP = BPool->Obtain(Quantum)))
+      {if (slot) --(IO.File->vecReq);
+       return false;
+      }
 
    jP = new XrdXrootdReadVJob(this, IO.File, Link, bP, Quantum,
-                              rdVec, rdVecNum);
+                              rdVec, rdVecNum, slot);
 
 // Account for the request the same way the aio read path does, so that
 // as_maxperlnk / as_maxpersrv and the reported async stats stay meaningful.
