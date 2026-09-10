@@ -391,6 +391,24 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
        if (!as_aioOK) eDest.Say("Config asynchronous I/O has been disabled!");
       }
 
+// [HACK] Asynchronous readv, for measuring what client request concurrency
+// through a cache is worth. Deliberately independent of as_aioOK: that gets
+// turned off for caching proxies, which is exactly where we want this. The
+// value caps in-flight async requests per link (shared with the aio read
+// path, since both bump linkAioReq). Settable from a config file with
+// 'setenv'.
+//
+   if (char *cP = getenv("XRD_HACK_ASYNC_READV"); cP && *cP)
+      {as_maxvecs = atoi(cP);
+       if (as_maxvecs < 0) as_maxvecs = 0;
+       if (as_maxvecs > 0)
+          {snprintf(buff, sizeof(buff),
+                    "%d in flight per link - THIS IS A TEST BUILD",
+                    as_maxvecs);
+           eDest.Say("Config HACK asynchronous readv enabled: ", buff);
+          }
+      }
+
 // Compute the maximum stutter allowed during async I/O (one per 64k)
 //
    if (as_segsize > 65536) as_okstutter = as_segsize/65536;

@@ -154,10 +154,14 @@ static const int  useSF    = 2;
 /*               C l a s s   X r d X r o o t d P r o t o c o l                */
 /******************************************************************************/
   
+class XrdXrootdReadVJob;
+struct XrdOucIOVec;
+
 class XrdXrootdProtocol : public XrdProtocol, public XrdXrootd::gdCallBack,
                           public XrdSfsDio,   public XrdSfsXio
 {
 friend class XrdXrootdAdmin;
+friend class XrdXrootdReadVJob;  // [HACK] async readv, see XrdXrootdXeq.cc
 public:
 
        void          aioUpdate(int val) {srvrAioOps += val;}
@@ -219,6 +223,8 @@ static const int     maxStreams = 16;
 // async configuration values (referenced outside this class)
 //
 static int           as_maxperlnk; // Max async requests per link
+static int           as_maxvecs;   // [HACK] Max async readv in flight per
+                                   //        link; 0 = feature off
 static int           as_maxperreq; // Max async ops per request
 static int           as_maxpersrv; // Max async ops per server
 static int           as_miniosz;   // Min async request size
@@ -285,6 +291,7 @@ enum RD_func {RD_chmod = 0, RD_chksum,  RD_dirlist, RD_locate, RD_mkdir,
        int   do_Qxattr();
        int   do_Read();
        int   do_ReadV();
+       bool  do_ReadVAsync(XrdOucIOVec *rdVec, int rdVecNum, int Quantum);
        int   do_ReadAll();
        int   do_ReadNone(int &retc, int &pathID);
        int   do_Rm();

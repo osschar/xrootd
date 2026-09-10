@@ -57,6 +57,7 @@
 #include "Xrd/XrdBuffer.hh"
 #include "Xrd/XrdInet.hh"
 #include "Xrd/XrdLinkCtl.hh"
+#include "Xrd/XrdScheduler.hh"
 #include "XrdXrootd/XrdXrootdAioFob.hh"
 #include "XrdXrootd/XrdXrootdCallBack.hh"
 #include "XrdXrootd/XrdXrootdFile.hh"
@@ -2739,6 +2740,193 @@ int XrdXrootdProtocol::do_ReadNone(int &retc, int &pathID)
    return 0;
 }
 
+
+/******************************************************************************/
+/*      [ H A C K ]   A s y n c h r o n o u s   r e a d v   ( t e s t )       */
+/******************************************************************************/
+
+// This is a measurement scaffold, not a proposed implementation. Normally
+// do_ReadV() runs to completion on the link's control thread, so a link carries
+// exactly one vector read at a time. In front of a WAN origin that collapses a
+// client's request concurrency to one and costs a factor of 7-9 on a cold
+// cache. XrdXrootdReadVJob just moves the body of do_ReadV() onto a scheduler
+// thread so several vector reads can be in flight on one link, which is enough
+// to measure what the concurrency is worth.
+//
+// It is NOT the fix: it ties up a thread per in-flight request, and it gives
+// the storage layer no way to say whether concurrency is safe for it. Enabled
+// only by XRD_HACK_ASYNC_READV; off by default. See the commit message.
+
+class XrdXrootdReadVJob : public XrdJob
+{
+public:
+
+         XrdXrootdReadVJob(XrdXrootdProtocol *pP, XrdXrootdFile *fP,
+                           XrdLink *lP, XrdBuffer *bP, int qsz,
+                           const XrdOucIOVec *vP, int vN)
+                          : XrdJob("async readv"),
+                            protP(pP), fileP(fP), linkP(lP), bufP(bP),
+                            rdVec(vP, vP+vN), Quantum(qsz)
+                          {Response = pP->Response;}
+
+virtual ~XrdXrootdReadVJob() {}
+
+         void DoIt() override;
+
+private:
+
+         void Finish();
+         int  SendError(XrdSfsXferSize xfrSZ);
+
+static const char        *TraceID;
+
+XrdXrootdProtocol        *protP;
+XrdXrootdFile            *fileP;
+XrdLink                  *linkP;
+XrdBuffer                *bufP;
+std::vector<XrdOucIOVec>  rdVec;
+XrdXrootdResponse         Response;
+int                       Quantum;
+};
+
+const char *XrdXrootdReadVJob::TraceID = "areadv";
+
+/******************************************************************************/
+
+void XrdXrootdReadVJob::DoIt()
+{
+   const int hdrSZ = sizeof(readahead_list);
+   struct readahead_list respHdr;
+   XrdSfsXferSize rdVAmt = 0, rdVXfr = 0, xfrSZ = 0;
+   int rdVecNum = static_cast<int>(rdVec.size());
+   int i, rdVNow = 0, Qleft = Quantum;
+   char *buffp = bufP->buff;
+   int  currFH = rdVec[0].info;
+
+   memcpy(respHdr.fhandle, &currFH, sizeof(respHdr.fhandle));
+
+// Run through the elements as do_ReadV() does. Every element refers to the
+// same file (do_ReadVAsync() verified that) so there is no file switch to
+// handle here and no file table lookup from this thread.
+//
+   for (i = 0; i < rdVecNum; i++)
+       {if (Qleft < (rdVec[i].size + hdrSZ))
+           {if (rdVAmt)
+               {xfrSZ = fileP->XrdSfsp->readv(&rdVec[rdVNow], i-rdVNow);
+                if (xfrSZ != rdVAmt) {SendError(xfrSZ); return Finish();}
+               }
+            if (Response.Send(kXR_oksofar, bufP->buff, Quantum-Qleft) < 0)
+               return Finish();
+            Qleft  = Quantum;
+            buffp  = bufP->buff;
+            rdVNow = i; rdVXfr += rdVAmt; rdVAmt = 0;
+           }
+
+        xfrSZ = rdVec[i].size; rdVAmt += xfrSZ;
+        respHdr.rlen   = htonl(xfrSZ);
+        respHdr.offset = htonll(rdVec[i].offset);
+        memcpy(buffp, &respHdr, hdrSZ);
+        rdVec[i].data = buffp + hdrSZ;
+        buffp += (xfrSZ+hdrSZ); Qleft -= (xfrSZ+hdrSZ);
+       }
+
+// Flush the tail. do_ReadV() gets this from the sentinel element it appends;
+// we simply do it after the loop.
+//
+   if (rdVAmt)
+      {xfrSZ = fileP->XrdSfsp->readv(&rdVec[rdVNow], rdVecNum-rdVNow);
+       if (xfrSZ != rdVAmt) {SendError(xfrSZ); return Finish();}
+       rdVXfr += rdVAmt;
+      }
+
+   fileP->Stats.rvOps(rdVXfr, rdVecNum);
+   TRACE(FSIO, "fh=" <<currFH<<" areadV "<<rdVXfr<<" in "<<rdVecNum<<" segs");
+
+   if (Quantum != Qleft) Response.Send(bufP->buff, Quantum-Qleft);
+      else               Response.Send();
+   Finish();
+}
+
+/******************************************************************************/
+
+// Simplified form of XrdXrootdProtocol::fsError()'s SFS_ERROR branch. The
+// redirect, stall and deferral cases it handles cannot arise from readv(), and
+// the open-path special cases do not apply. Note that XrdSfsFile::error is
+// shared by every request on the file, so this races if more than one async
+// readv per file is allowed; see the per-file cap.
+
+int XrdXrootdReadVJob::SendError(XrdSfsXferSize xfrSZ)
+{
+   XrdOucErrInfo &eInfo = fileP->XrdSfsp->error;
+   const char *eMsg;
+   int ecode = 0, rc;
+
+// A short read is not an error down below; do_ReadV() makes it one here.
+//
+   if (xfrSZ >= 0) eInfo.setErrInfo(-ENODATA, "readv past EOF");
+
+   eMsg = eInfo.getErrText(ecode);
+   TRACE(FSIO, "areadV error " <<ecode <<' ' <<(eMsg ? eMsg : ""));
+   rc = Response.Send((XErrorCode)XProtocol::mapError(ecode), eMsg);
+   if (eInfo.extData()) eInfo.Reset();
+   return rc;
+}
+
+/******************************************************************************/
+
+void XrdXrootdReadVJob::Finish()
+{
+// Order matters: the link reference is what keeps the protocol object alive,
+// so drop it last of the three. Mirrors XrdXrootdNormAio::Recycle().
+//
+   XrdXrootdProtocol::BPool->Release(bufP);
+   fileP->Ref(-1);
+   protP->aioUpdReq(-1);
+   protP->aioUpdate(-1);
+   linkP->setRef(-1);
+   delete this;
+}
+
+/******************************************************************************/
+/*                       d o _ R e a d V A s y n c                            */
+/******************************************************************************/
+
+// Returns true if the request has been handed to a scheduler thread, in which
+// case the caller must return 0 and touch nothing further. IO.File must
+// already be set and the file table lookup done.
+
+bool XrdXrootdProtocol::do_ReadVAsync(XrdOucIOVec *rdVec, int rdVecNum,
+                                      int Quantum)
+{
+   XrdXrootdReadVJob *jP;
+   XrdBuffer         *bP;
+
+// Every element must refer to the same file: the job takes a single file
+// reference and never consults FTab from its own thread.
+//
+   for (int i = 1; i < rdVecNum; i++)
+       if (rdVec[i].info != rdVec[0].info) return false;
+
+// The job needs a buffer of its own. argp belongs to the link and is refilled
+// with the next request the moment we return.
+//
+   if (!(bP = BPool->Obtain(Quantum))) return false;
+
+   jP = new XrdXrootdReadVJob(this, IO.File, Link, bP, Quantum,
+                              rdVec, rdVecNum);
+
+// Account for the request the same way the aio read path does, so that
+// as_maxperlnk / as_maxpersrv and the reported async stats stay meaningful.
+//
+   Link->setRef(1);
+   IO.File->Ref(1);
+   aioUpdReq(1);
+   aioUpdate(1);
+
+   Sched->Schedule((XrdJob *)jP);
+   return true;
+}
+
 /******************************************************************************/
 /*                               d o _ R e a d V                              */
 /******************************************************************************/
@@ -2815,12 +3003,6 @@ int XrdXrootdProtocol::do_ReadV()
 //
    Quantum = totSZ < maxTransz ? totSZ : maxTransz;
 
-// Now obtain the right size buffer
-//
-   if ((Quantum < halfBSize && Quantum > 1024) || Quantum > argp->bsize)
-      {if ((k = getBuff(1, Quantum)) <= 0) return k;}
-      else if (hcNow < hcNext) hcNow++;
-
 // Check that we really have at least one file open. This needs to be done
 // only once as this code runs in the control thread.
 //
@@ -2834,6 +3016,21 @@ int XrdXrootdProtocol::do_ReadV()
    memcpy(respHdr.fhandle, &currFH, sizeof(respHdr.fhandle));
    if (!(IO.File = FTab->Get(currFH))) return Response.Send(kXR_FileNotOpen,
                                       "readv does not refer to an open file");
+
+// [HACK] Hand the whole request to a scheduler thread so that this link can
+// carry more than one vector read at a time. Monitoring is excluded because
+// Monitor.Agent is not safe to use off the control thread. rdVBreak is the
+// element count before the flush sentinel was appended.
+//
+   if (as_maxvecs > 0 && !rvMon
+   &&  linkAioReq < as_maxvecs && srvrAioOps < as_maxpersrv
+   &&  do_ReadVAsync(rdVec, rdVBreak, Quantum)) return 0;
+
+// Now obtain the right size buffer
+//
+   if ((Quantum < halfBSize && Quantum > 1024) || Quantum > argp->bsize)
+      {if ((k = getBuff(1, Quantum)) <= 0) return k;}
+      else if (hcNow < hcNext) hcNow++;
 
 // Setup variables for running through the list.
 //
