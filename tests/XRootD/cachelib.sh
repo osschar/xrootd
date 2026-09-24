@@ -24,6 +24,15 @@
 
 ORIGIN_HOST="root://localhost:5094"
 
+# CI PROBE: how long a wait polls before giving up. 180 s rather than 20 s so
+# that a late record can be told apart from one that never arrives.
+: "${PFC_WAIT_SECS:=180}"
+# A wait slower than this keeps a copy of the server log for later.
+: "${PFC_SLOW_SECS:=5}"
+# One line per wait, pass or fail, outside the test directory, which teardown
+# removes.
+: "${PFC_PROBE_DIR:=${BINARY_DIR:-${PWD}}/pfc-probe}"
+
 #-------------------------------------------------------------------------------
 # Paths. setup and run are separate processes, so derive rather than export.
 #-------------------------------------------------------------------------------
@@ -123,25 +132,93 @@ function json_int() {
 	echo "$1" | sed -n "s/.*\"$2\":\(-\{0,1\}[0-9]\{1,\}\).*/\1/p"
 }
 
+#-------------------------------------------------------------------------------
+# CI PROBE: timed polling
+#-------------------------------------------------------------------------------
+
+function probe_now() {
+	date +%s.%N
+}
+
+# probe_record <what> <t0> <outcome> [extra...] -- append one line to the
+# probe log: wall time, test, outcome, seconds waited, what, extra.
+function probe_record() {
+	local what="$1" t0="$2" outcome="$3" t1 dt
+	shift 3
+	t1="$(probe_now)"
+	dt="$(awk -v a="${t0}" -v b="${t1}" 'BEGIN { printf "%.2f", b - a }')"
+	mkdir -p "${PFC_PROBE_DIR}"
+	echo "${t1} ${NAME} ${outcome} ${dt} ${what} $*" >> "${PFC_PROBE_DIR}/waits.log"
+	# Keep the evidence of a slow or failed wait: teardown deletes it.
+	if [[ "${outcome}" != ok ]] ||
+	   awk -v d="${dt}" -v s="${PFC_SLOW_SECS}" 'BEGIN { exit !(d > s) }'; then
+		local tag
+		tag="${NAME}-$(date +%H%M%S)-$$"
+		cp "${PWD}/${NAME}/xrootd.log" "${PFC_PROBE_DIR}/${tag}-xrootd.log" 2>/dev/null || true
+		cp "$(gstream_log)" "${PFC_PROBE_DIR}/${tag}-gstream.json" 2>/dev/null || true
+		cp "$(gstream_log).recv" "${PFC_PROBE_DIR}/${tag}-gstream.recv" 2>/dev/null || true
+	fi
+}
+
+# probe_poll <what> <command...> -- run command every 0.2 s until it succeeds
+# or PFC_WAIT_SECS have passed. Records how long that took either way, and
+# returns non-zero on timeout.
+function probe_poll() {
+	local what="$1" t0 deadline
+	shift
+	t0="$(probe_now)"
+	deadline=$(( $(date +%s) + PFC_WAIT_SECS ))
+	while true; do
+		if "$@"; then
+			probe_record "${what}" "${t0}" ok
+			return 0
+		fi
+		if (( $(date +%s) >= deadline )); then
+			probe_record "${what}" "${t0}" TIMEOUT
+			return 1
+		fi
+		sleep 0.2
+	done
+}
+
+# The file_close record for lfn $1 at access_cnt $2, if it has arrived.
+function gstream_close_record() {
+	grep '"event":"file_close"' "$(gstream_log)" 2>/dev/null |
+	grep "\"lfn\":\"/$1\"" | grep "\"access_cnt\":$2," | tail -1
+}
+
+function have_gstream_close() {
+	[[ -n "$(gstream_close_record "$1" "$2")" ]]
+}
+
+function have_any_gstream_close() {
+	grep '"event":"file_close"' "$(gstream_log)" 2>/dev/null | grep -q "\"lfn\":\"/$1\""
+}
+
 # The file_close record for lfn $1 at access_cnt $2. The record is only emitted
 # when the cache closes the file, which happens after the client has gone, and
 # the g-stream is flushed on a timer on top of that -- so wait, do not race.
 function wait_for_gstream_close() {
-	local rec
-	for _ in $(seq 100); do
-		rec="$(grep '"event":"file_close"' "$(gstream_log)" 2>/dev/null |
-		       grep "\"lfn\":\"/$1\"" | grep "\"access_cnt\":$2," | tail -1)" || true
-		if [[ -n "${rec}" ]]; then
-			echo "${rec}"
-			return 0
-		fi
-		sleep 0.2
-	done
+	if probe_poll "gstream_close /$1 acc=$2" have_gstream_close "$1" "$2"; then
+		gstream_close_record "$1" "$2"
+		return 0
+	fi
 	# Say whether the log is empty or merely missing this record: the first
 	# means the collector never received anything, the second that the cache
 	# did not close the file when expected. They need different fixes.
-	error "timed out after 20 s waiting for g-stream file_close of /$1" \
+	error "timed out after ${PFC_WAIT_SECS} s waiting for g-stream file_close of /$1" \
 	      "at access_cnt $2; $(gstream_diagnosis)"
+}
+
+# The blacklist test's negative: no file_close record for lfn $1 at all. The
+# record, if one were coming, would be flushed within a couple of seconds of the
+# close; wait longer than that before concluding it is absent.
+function assert_no_gstream_close() {
+	sleep 5
+	if have_any_gstream_close "$1"; then
+		error "unexpected g-stream file_close record for /$1:" \
+		      "$(grep "\"lfn\":\"/$1\"" "$(gstream_log)")"
+	fi
 }
 
 # Why might a record be missing? A dead collector and a cache that never closed
@@ -161,15 +238,9 @@ function gstream_diagnosis() {
 # read lands in, and when it appears in the log, both move around; a running
 # total does not. Waits for the first record, then lets stragglers land.
 function sum_gstream_todisk() {
-	local rec found=""
-	for _ in $(seq 100); do
-		found="$(grep '"event":"file_close"' "$(gstream_log)" 2>/dev/null |
-		         grep "\"lfn\":\"/$1\"" | head -1)" || true
-		[[ -n "${found}" ]] && break
-		sleep 0.2
-	done
-	if [[ -z "${found}" ]]; then
-		error "timed out after 20 s waiting for any g-stream file_close of /$1;" \
+	local rec
+	if ! probe_poll "gstream_any_close /$1" have_any_gstream_close "$1"; then
+		error "timed out after ${PFC_WAIT_SECS} s waiting for any g-stream file_close of /$1;" \
 		      "$(gstream_diagnosis)"
 	fi
 	sleep 3
@@ -235,16 +306,15 @@ function report_cinfo_state() {
 # that is refused after the File was constructed still leaves a record behind.
 # Where that can happen, wait on the final state instead: see
 # wait_for_cinfo_complete().
+function has_access_record() {
+	[[ -f "$1" ]] && [[ "$(cinfo_n_acc "$1")" == "$2" ]]
+}
+
 function wait_for_access_record() {
-	for _ in $(seq 100); do
-		if [[ -f "$1" ]] && [[ "$(cinfo_n_acc "$1")" == "$2" ]]; then
-			return 0
-		fi
-		sleep 0.2
-	done
-	echo "timed out after 20 s waiting for access record $2 of $1"
+	probe_poll "access_record $(basename "$1") n=$2" has_access_record "$1" "$2" && return 0
+	echo "timed out after ${PFC_WAIT_SECS} s waiting for access record $2 of $1"
 	report_cinfo_state "$1"
-	error "timed out after 20 s waiting for access record $2 of $1"
+	error "timed out after ${PFC_WAIT_SECS} s waiting for access record $2 of $1"
 }
 
 # Wait for every block of the file to be on disk.
@@ -253,18 +323,16 @@ function wait_for_access_record() {
 # -- so unlike an access count there is nothing to overshoot and no baseline to
 # sample. Prefer this wherever the assertion that follows is about the file
 # being fully cached.
-function wait_for_cinfo_complete() {
+function is_cinfo_complete() {
 	local nblk ndone state
-	for _ in $(seq 100); do
-		if [[ -f "$1" ]]; then
-			read -r nblk ndone state <<< "$(cinfo_blocks "$1")"
-			if [[ "${state}" == complete ]] && [[ "${nblk}" == "${ndone}" ]]; then
-				return 0
-			fi
-		fi
-		sleep 0.2
-	done
-	echo "timed out after 20 s waiting for $1 to be complete"
+	[[ -f "$1" ]] || return 1
+	read -r nblk ndone state <<< "$(cinfo_blocks "$1")"
+	[[ "${state}" == complete ]] && [[ "${nblk}" == "${ndone}" ]]
+}
+
+function wait_for_cinfo_complete() {
+	probe_poll "cinfo_complete $(basename "$1")" is_cinfo_complete "$1" && return 0
+	echo "timed out after ${PFC_WAIT_SECS} s waiting for $1 to be complete"
 	report_cinfo_state "$1"
-	error "timed out after 20 s waiting for $1 to be complete"
+	error "timed out after ${PFC_WAIT_SECS} s waiting for $1 to be complete"
 }

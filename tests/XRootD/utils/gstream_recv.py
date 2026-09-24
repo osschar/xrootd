@@ -48,8 +48,14 @@ if devnull > 2:
 with open(pidfile, "w") as f:
     f.write("%d\n" % os.getpid())
 
-with open(outfile, "a", buffering=1) as out:
+# CI PROBE: a sidecar with the arrival time and size of every datagram, so a
+# late record can be placed on the same clock as the rest of the probe.
+import time
+
+with open(outfile, "a", buffering=1) as out, open(outfile + ".recv", "a", buffering=1) as rcv:
+    rcv.write("# start %.6f SO_RCVBUF %d\n" % (time.time(), sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)))
     while True:
-        data, _ = sock.recvfrom(65536)
+        data, peer = sock.recvfrom(65536)
+        rcv.write("%.6f %d %s\n" % (time.time(), len(data), peer[0]))
         text = data.rstrip(b"\x00").decode("utf-8", "replace")
         out.write(text.rstrip("\n") + "\n")
