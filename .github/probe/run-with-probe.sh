@@ -38,8 +38,9 @@ wait "${sampler}" 2>/dev/null
 (
 	cd "${ws}" || exit 0
 	cxx="$(command -v c++ || command -v g++ || command -v clang++)" || exit 0
-	fix="$(git -c safe.directory='*' log -1 --format=%H -- src/Xrd/XrdScheduler.cc)"
-	git -c safe.directory='*' show "${fix}^:src/Xrd/XrdScheduler.cc" > "${probe}/XrdScheduler-before-fix.cc"
+	# master's XrdScheduler.cc, unmodified, is kept next to this script: deriving
+	# it from history breaks as soon as a second commit touches the file.
+	cp "${here}/XrdScheduler-before-fix.cc" "${probe}/XrdScheduler-before-fix.cc"
 	lib="${ws}/build/lib/libXrdUtils.so"
 	# Name the library file itself: with -lXrdUtils a missing build tree
 	# silently falls back to a system libXrdUtils, which has no fix.
