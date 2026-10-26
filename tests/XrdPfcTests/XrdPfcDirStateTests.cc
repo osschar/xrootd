@@ -360,6 +360,29 @@ TEST(DirStateStats, SnapshotStatsKeepWhatTheResetClears)
    EXPECT_NE(dump.find("b_hit=4096"), std::string::npos) << dump;
 }
 
+TEST(DirStateStats, SumsPastTheIntRange)
+{
+   Accounting a;
+   a.cache_file("/a/b/f1", 8);
+   a.cache_file("/a/c/f2", 8);
+
+   // As process_queues() applies a file's update record.
+   FileStats fs;
+   fs.m_NumIos   = 1;
+   fs.m_Duration = 2000000000;
+   a.m_fs.find_dirstate_for_lfn("/a/b/f1")->m_here_stats.AddUp(fs);
+   a.m_fs.find_dirstate_for_lfn("/a/c/f2")->m_here_stats.AddUp(fs);
+   a.beat(false);
+
+   EXPECT_EQ(a.find("/a")->m_sshot_stats.m_Duration, 4000000000LL);
+   EXPECT_EQ(a.root().m_sshot_stats.m_Duration, 4000000000LL);
+
+   testing::internal::CaptureStdout();
+   a.m_fs.dump_recursively(9);
+   const std::string dump = testing::internal::GetCapturedStdout();
+   EXPECT_NE(dump.find("duration=4000000000"), std::string::npos) << dump;
+}
+
 //==============================================================================
 // A reaped directory's leftover st_blocks leave the tree and the global total
 //==============================================================================
