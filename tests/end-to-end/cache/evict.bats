@@ -58,8 +58,8 @@ evict() {
 @test "an only-if-cached read fetches nothing from the origin" {
     fill
     xrdcp -f "$CACHE_URL//$F?only-if-cached" out.dat
-    run -0 fetched_total "$F"
-    assert_output $((32 * BLOCK))
+    run -0 close_field "$F" 2 b_todisk
+    assert_output 0
 }
 
 @test "evict removes the data file from the cache" {
@@ -94,6 +94,8 @@ evict() {
     evict
     wait_for 10 test ! -e "$(cinfo "$F")"
     xrdcp -f "$CACHE_URL//$F" out.dat
-    run -0 fetched_total "$F"
+    # the access count starts again with the new cinfo file, thus both
+    # records have access 1
+    run -0 fetched_total "$F" 2
     assert_output $((2 * 32 * BLOCK))
 }

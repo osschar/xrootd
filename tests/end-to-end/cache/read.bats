@@ -144,7 +144,7 @@ setup() {
 
 @test "concurrent readers of the same blocks fetch them once" {
     xrdpfc-read multi "$CACHE_URL//$F" out.dat 4 $((2 * BLOCK))
-    run -0 fetched_total "$F"
+    run -0 close_field "$F" 1 b_todisk
     assert_output $((2 * BLOCK))
 }
 

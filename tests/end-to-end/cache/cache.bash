@@ -65,12 +65,19 @@ _close_record() {
     close_records "$1" | grep -F "\"access_cnt\":$2," | tail -1 | grep .
 }
 
-# The sum of b_todisk in all file_close records of <lfn>: all bytes which the
-# origin sent for it. It waits for the first record, then 3 s for the others.
+# fetched_total <lfn> <n>: the sum of b_todisk in the file_close records of
+# <lfn>, all bytes which the origin sent for it. It waits up to 20 s for <n>
+# records.
 fetched_total() {
-    wait_for 20 close_records "$1" > /dev/null || return 1
-    sleep 3
+    wait_for 20 _has_close_records "$1" "$2" || {
+        echo "$(close_records "$1" | wc -l | tr -d ' ') file_close records of /$1, expected $2" >&2
+        return 1
+    }
     close_records "$1" | sed -n 's/.*"b_todisk":\([0-9]*\).*/\1/p' | awk '{ s += $1 } END { print s + 0 }'
+}
+
+_has_close_records() {
+    (( $(close_records "$1" | wc -l) >= $2 ))
 }
 
 # The path of the .cinfo file of <lfn> in the cache

@@ -14,9 +14,11 @@
 #include "XrdCl/XrdClFile.hh"
 #include "XrdCl/XrdClXRootDResponses.hh"
 
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -155,8 +157,10 @@ int cmd_multi(const std::vector<std::string> &args)
 {
    // multi <url> <outfile> <nreaders> <length>
    // nreaders independent opens reading the same first <length> bytes at the
-   // same time, so they contend for the same blocks. Every reader must return
-   // identical data; the cache should fetch those bytes from the origin once.
+   // same time, so they contend for the same blocks. The readers wait until
+   // all are open, thus the cache serves them from one File and sends one
+   // file_close record. Every reader must return identical data; the cache
+   // should fetch those bytes from the origin once.
    if (args.size() != 4) return 2;
 
    const std::string url = args[0];
@@ -168,11 +172,21 @@ int cmd_multi(const std::vector<std::string> &args)
    std::vector<int> rc(nread, 0);
    std::vector<std::thread> threads;
 
+   std::mutex              mtx;
+   std::condition_variable cv;
+   int                     n_opened = 0;
+
    for (int i = 0; i < nread; ++i)
    {
       threads.emplace_back([&, i]() {
          XrdCl::File f;
          XrdCl::XRootDStatus st = f.Open(url, XrdCl::OpenFlags::Read);
+         {
+            // a failed open arrives too, else the others would wait forever
+            std::unique_lock<std::mutex> lck(mtx);
+            if (++n_opened == nread) cv.notify_all();
+            else cv.wait(lck, [&] { return n_opened == nread; });
+         }
          if ( ! st.IsOK()) { rc[i] = fail("open", st); return; }
          uint32_t got = 0;
          st = f.Read(0, length, bufs[i].data(), got);

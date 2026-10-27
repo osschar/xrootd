@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # A restart of the cache keeps the files on disk. Before the restart, the
-# cache has one complete file and one file with only blocks 0 and 8 of 32.
-# The tests share this state.
+# cache has one complete file and two files, part.dat and rest.dat, with only
+# blocks 0 and 8 of 32. The tests share this state; only one test reads
+# rest.dat.
 
 load cache.bash
 
@@ -10,10 +11,13 @@ setup_file() {
     start_cache
     make_origin_file full.dat 32
     make_origin_file part.dat 32
+    make_origin_file rest.dat 32
     xrdcp -f "$CACHE_URL//full.dat" "$BATS_FILE_TMPDIR/full.dat"
     xrdpfc-read read "$CACHE_URL//part.dat" "$BATS_FILE_TMPDIR/part.dat" 0:4096 $((8 * BLOCK)):4096
+    xrdpfc-read read "$CACHE_URL//rest.dat" "$BATS_FILE_TMPDIR/rest.dat" 0:4096 $((8 * BLOCK)):4096
     wait_for_close full.dat 1
     wait_for_close part.dat 1
+    wait_for_close rest.dat 1
     restart_server cache
 }
 
@@ -48,10 +52,10 @@ setup() {
 }
 
 @test "a full read of a partial file after a restart fetches only the missing blocks" {
-    xrdcp -f "$CACHE_URL//part.dat" out.dat
-    # the blocks 0 and 8 came before the restart, the 30 others now
-    run -0 fetched_total part.dat
-    assert_output $((32 * BLOCK))
+    xrdcp -f "$CACHE_URL//rest.dat" out.dat
+    # the blocks 0 and 8 came before the restart
+    run -0 close_field rest.dat 2 b_todisk
+    assert_output $((30 * BLOCK))
 }
 
 @test "a full read of a partial file after a restart has the content of the origin" {
